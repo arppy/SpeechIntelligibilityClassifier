@@ -100,7 +100,7 @@ def prepare_Torgo_dataset(batch, feature_extractor, tokenizer=None, augmentor=No
     if 'C' in uid:
         batch['severity'] = 0
     else:
-        batch['severity'] = params.TORGO_dys_speaker_dict[uid]
+        batch['severity'] = params.dys_speaker_dict[params.TORGO]
     # encode target text to label ids
     batch['uid'] = uid
     batch['sentence'] = batch['transcription']
@@ -343,26 +343,7 @@ def get_TrogoGenerated_as_list(data_dir) :
     return file_paths, texts, labels
 
 def get_UASpeech_as_list(speakers, data_dir) :
-    # The 15 dysarthric speakers ordered strictly by your data pipeline array
-    all_dys_spks = [
-        "F05", "M08", "M09", "M10", "M14",  # Very Low (5)
-        "M05",  # Low
-        "M11", "F04",  # M11 (High) | F04 (Low)
-        "M07", "F02",  # M07 (Medium) | F02 (High)
-        "M16",  # Medium
-        "M04", "F03", "M12", "M01"  # High | High | High | High
-    ]
-    # The target integers matching Table 1 (5-2-2-6) and the paper's figures:
-    # 1=Very Low, 2=Low, 3=Medium, 4=High
-    all_dyslabels = [
-        1, 1, 1, 1, 1,  # F05, M08, M09, M10, M14 -> Very Low
-        2,  # M05                     -> Low
-        4, 2,  # M11 -> High             |  F04 -> Low
-        3, 4,  # M07 -> Medium           |  F02 -> High
-        3,  # M16                     -> Medium
-        4, 4, 4, 4  # M04, F03, M12, M01      -> High
-    ]
-    dys_speaker_dict = dict(zip(all_dys_spks, all_dyslabels))
+    dys_speaker_dict = params.dys_speaker_dict[params.UASPEECH]
     file_paths = []
     texts = []
     labels = []
@@ -414,23 +395,7 @@ class UASpeech(torch.utils.data.Dataset):
         self.processor = processor
         self.tokenizer = tokenizer
         self.torch_dtype = torch_dtype
-        self.all_dys_spks = [
-            "F05", "M08", "M09", "M10", "M14",  # Very Low Severity (Label 1)
-            "M05",  # Medium Severity (Label 3)
-            "M11", "F04",  # Low Severity (Label 2)
-            "M07", "F02",  # High Severity (Label 4)
-            "M16",  # Medium Severity (Label 3)
-            "M04", "F03", "M12", "M01"  # High/Very Low mix
-        ]
-        self.all_dyslabels = [
-            1, 1, 1, 1, 1,  # F05, M08, M09, M10, M14 -> Very Low (1)
-            3,  # M05                     -> Medium (3)
-            2, 2,  # M11, F04                -> Low (2)
-            4, 4,  # M07, F02                -> High (4)
-            3,  # M16                     -> Medium (3)
-            4, 4, 1, 4  # M04 (High), F03 (High), M12 (Very Low), M01 (High)
-        ]
-        self.dys_speaker_dict = dict(zip(self.all_dys_spks, self.all_dyslabels))
+        self.dys_speaker_dict = params.dys_speaker_dict[params.UASPEECH]
         self.file_paths = []
         self.labels = []
         for speaker_folder in os.listdir(data_dir):

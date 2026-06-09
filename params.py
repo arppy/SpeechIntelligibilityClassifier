@@ -70,8 +70,29 @@ whisper_arch = "openai/whisper-large-v3"
 #TORGO_dys_spks = ["F03", "F04", "M03", "F01", "M05", "M01", "M02", "M04"]
 #TORGO_dyslabels = [1, 1, 1, 2, 2, 3, 3, 3]
 # TORGO class as RnV2025 paper told
-TORGO_dys_spks = ["F04", "M03", "F03", "M05", "F01", "M01", "M02", "M04"]
-TORGO_dyslabels = [1, 1, 2, 3, 4, 4, 4, 4]
+dys_spks = {}
+dyslabels = {}
+dys_spks[TORGO] = ["F04", "M03", "F03", "M05", "F01", "M01", "M02", "M04"]
+dyslabels[TORGO] = [1, 1, 2, 3, 4, 4, 4, 4]
 
-TORGO_dys_speaker_dict = dict(zip(TORGO_dys_spks, TORGO_dyslabels))
+dys_spks[UASPEECH] = [
+    "F05", "M08", "M09", "M10", "M14",  # Very Low (5)
+    "M05",  # Low
+    "M11", "F04",  # M11 (High) | F04 (Low)
+    "M07", "F02",  # M07 (Medium) | F02 (High)
+    "M16",  # Medium
+    "M04", "F03", "M12", "M01"  # High | High | High | High
+]
+# The target integers matching Table 1 (5-2-2-6) and the paper's figures:
+# 1=Very Low, 2=Low, 3=Medium, 4=High
+dyslabels[UASPEECH] = [
+    1, 1, 1, 1, 1,  # F05, M08, M09, M10, M14 -> Very Low
+    2,  # M05                     -> Low
+    4, 2,  # M11 -> High             |  F04 -> Low
+    3, 4,  # M07 -> Medium           |  F02 -> High
+    3,  # M16                     -> Medium
+    4, 4, 4, 4  # M04, F03, M12, M01      -> High
+]
+dys_speaker_dict = {TORGO: dict(zip(dys_spks[TORGO], dyslabels[TORGO])),
+                    UASPEECH: dict(zip(dys_spks[UASPEECH], dyslabels[UASPEECH]))}
 label_count = {TORGO: 15, UASPEECH: 5, LACICON: 1, LACIDYS: 5, HUNDYS: 50, SZEGEDYS: 9}
