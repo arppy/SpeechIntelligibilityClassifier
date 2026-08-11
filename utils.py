@@ -342,7 +342,7 @@ def get_TrogoGenerated_as_list(data_dir) :
             labels.append(Torgo_label_to_idx[uid])
     return file_paths, texts, labels
 
-def get_UASpeech_as_list(speakers, data_dir) :
+def get_UASpeech_as_list(data_dir, only_dysarthric_speakers=False) :
     dys_speaker_dict = params.dys_speaker_dict[params.UASPEECH]
     file_paths = []
     texts = []
@@ -353,7 +353,9 @@ def get_UASpeech_as_list(speakers, data_dir) :
             for file_name in os.listdir(speaker_path):
                 file_path = os.path.join(speaker_path, file_name)
                 if file_name.endswith('.wav'):
-                    if speaker_folder in speakers :
+                    if speaker_folder not in dys_speaker_dict and only_dysarthric_speakers :
+                        continue
+                    else :
                         text_file_path = file_path.replace('.wav', '.sentence')
                         try:
                             with open(text_file_path, "r") as text_file:
