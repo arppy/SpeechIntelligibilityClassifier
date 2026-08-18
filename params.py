@@ -84,14 +84,14 @@ dys_spks[UASPEECH] = [
     "M04", "F03", "M12", "M01"  # High | High | High | High
 ]
 # The target integers matching Table 1 (5-2-2-6) and the paper's figures:
-# 1=Very Low, 2=Low, 3=Medium, 4=High
+# 0=Very Low, 1=Low, 2=Medium, 3=High
 dyslabels[UASPEECH] = [
-    1, 1, 1, 1, 1,  # F05, M08, M09, M10, M14 -> Very Low
-    2,  # M05                     -> Low
-    4, 2,  # M11 -> High             |  F04 -> Low
-    3, 4,  # M07 -> Medium           |  F02 -> High
-    3,  # M16                     -> Medium
-    4, 4, 4, 4  # M04, F03, M12, M01      -> High
+    0, 0, 0, 0, 0,  # F05, M08, M09, M10, M14 -> Very Low
+    1,  # M05                     -> Low
+    3, 1,  # M11 -> High             |  F04 -> Low
+    2, 3,  # M07 -> Medium           |  F02 -> High
+    2,  # M16                     -> Medium
+    3, 3, 3, 3  # M04, F03, M12, M01      -> High
 ]
 dys_speaker_dict = {TORGO: dict(zip(dys_spks[TORGO], dyslabels[TORGO])),
                     UASPEECH: dict(zip(dys_spks[UASPEECH], dyslabels[UASPEECH]))}
