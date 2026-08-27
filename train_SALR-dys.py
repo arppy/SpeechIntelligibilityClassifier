@@ -676,23 +676,6 @@ def loso_cv(
 # Replace the sets below with the actual UA-Speech word IDs from the corpus.
 # These are illustrative identifiers based on the dataset description.
 
-_DIGIT_IDS = {
-    "zero","one","two","three","four","five","six","seven","eight","nine",
-    "ten","eleven","twelve","thirteen","fourteen","fifteen","sixteen",
-    "seventeen","eighteen","nineteen","twenty","thirty","forty","fifty",
-    "sixty","seventy","eighty","ninety","hundred","thousand",
-    "million","billion","point","oh","double","triple",
-    "hundred_thousand","million_dollars",
-    "first","second","third","fourth","fifth",
-}
-_LETTER_IDS = {chr(ord("a") + i) for i in range(26)}
-_COMMAND_IDS = {
-    "backspace","cancel","caps_lock","control","delete","end","enter",
-    "escape","home","insert","page_down","page_up","shift","space",
-    "tab","undo","start","stop","select",
-}
-COMMON_WORD_IDS = _DIGIT_IDS | _LETTER_IDS | _COMMAND_IDS  # ≈ 155 words
-
 
 def intelligibility_to_severity(intelligibility: float) -> str:
     """Map % intelligibility → severity label (Table 1)."""
@@ -746,7 +729,7 @@ def load_ua_speech(
     for spk_id, spk_meta in meta.items():
         spk_dir = os.path.join(data_root, spk_id)
         if not os.path.isdir(spk_dir):
-            print(f"  Warning: directory not found for speaker {spk_id}")
+            #print(f"  Warning: directory not found for speaker {spk_id}")
             continue
 
         if spk_meta["is_dysarthric"]:
@@ -760,6 +743,10 @@ def load_ua_speech(
                 continue
 
             word_id = os.path.splitext(fname)[0].lower()
+            if word_id.split("_")[2].startswith('u'):
+                word_id = word_id.split("_")[1] +"_"+ word_id.split("_")[2]
+            else:
+                word_id = word_id.split("_")[2]
             wav_path = os.path.join(spk_dir, fname)
 
             try:
@@ -784,7 +771,11 @@ def load_ua_speech(
                     waveform = wt.squeeze(0).numpy()
 
             # Determine common vs uncommon word
-            is_common = word_id in COMMON_WORD_IDS
+            # word_id is bx_uwx for uncommon words
+            if word_id.startswith("b"):
+                is_common = False
+            else:
+                is_common = True
 
             samples.append({
                 "waveform":   waveform,
