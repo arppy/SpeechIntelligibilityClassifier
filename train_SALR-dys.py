@@ -35,6 +35,8 @@ from transformers import Wav2Vec2Model, Wav2Vec2Processor
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.linear_model import LogisticRegression
 
+from collections import defaultdict
+from torch.utils.data import BatchSampler
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants  (all directly from the paper)
@@ -44,7 +46,7 @@ SAMPLE_RATE        = 16000   # wav2vec 2.0 native sample rate
 NUM_CLASSES        = 4        # very-low / low / medium / high severity
 
 # § 2.2 – fine-tuning hyper-parameters
-BATCH_SIZE         = 4
+BATCH_SIZE         = 3
 LEARNING_RATE      = 5e-4     # 0.0005
 ADAM_BETAS         = (0.9, 0.98)
 ADAM_EPSILON       = 1e-8
@@ -297,53 +299,120 @@ class SALRLoss(nn.Module):
         return 0.0 if step < self.warmup_steps else 1.0
 
     # ------------------------------------------------------------------
+
     def _build_triplets(
-        self,
-        embeddings: torch.Tensor,           # (B, D)
-        severities: torch.Tensor,           # (B,)
-        speaker_ids: List[str],
-        word_ids:    List[str],
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+            self,
+            embeddings: torch.Tensor,  # (B, D)
+            severities: torch.Tensor,  # (B,)
+            speaker_ids: List[str],
+            word_ids: List[str],
+    ) -> Tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor]
+    ]:
         """
-        Construct (anchor, positive, negative) triplets from the batch
-        following the paper's prescription.
+        Build SALR triplets from a batch produced by
+        BalancedTripletBatchSampler.
 
-        For each sample i (anchor E_AX):
-          negative  = random sample j from the *same* speaker, *different* word
-          positive  = random sample k from a *different* speaker, *same* severity
+        CONTRACT
+        --------
+        Every 3 consecutive samples have the structure:
 
-        Returns None if the batch is too small to form any valid triplet.
+            [Anchor, Negative, Positive]
+
+        Anchor:
+            Word A, Speaker X
+
+        Negative:
+            Word B, Speaker X
+
+        Positive:
+            Word B, Speaker Y
+
+        Required:
+            A != B
+            X != Y
+            severity(A,X) == severity(B,X) == severity(B,Y)
+
+        The sampler guarantees this structure.
+        This function only validates the contract and converts
+        the batch into tensors suitable for TripletMarginLoss.
         """
+
         B = embeddings.size(0)
-        anchors, positives, negatives = [], [], []
 
-        for i in range(B):
-            sev_i = severities[i].item()
-            spk_i = speaker_ids[i]
-            wrd_i = word_ids[i]
+        # A valid SALR batch must consist of complete triplets.
+        if B % 3 != 0:
+            return None, None, None
 
-            # Negative: E_BX  (same speaker, different word)
-            neg_pool = [
-                j for j in range(B)
-                if speaker_ids[j] == spk_i and word_ids[j] != wrd_i
-            ]
+        anchors = []
+        positives = []
+        negatives = []
 
-            # Positive: E_BY  (different speaker, same severity)
-            pos_pool = [
-                j for j in range(B)
-                if speaker_ids[j] != spk_i and severities[j].item() == sev_i
-            ]
+        num_triplets = B // 3
 
-            if not neg_pool or not pos_pool:
+        for triplet_idx in range(num_triplets):
+
+            start = triplet_idx * 3
+
+            anchor_idx = start
+            negative_idx = start + 1
+            positive_idx = start + 2
+
+            # --------------------------------------------------
+            # Read metadata
+            # --------------------------------------------------
+
+            anchor_spk = speaker_ids[anchor_idx]
+            negative_spk = speaker_ids[negative_idx]
+            positive_spk = speaker_ids[positive_idx]
+
+            anchor_word = word_ids[anchor_idx]
+            negative_word = word_ids[negative_idx]
+            positive_word = word_ids[positive_idx]
+
+            anchor_sev = severities[anchor_idx].item()
+            negative_sev = severities[negative_idx].item()
+            positive_sev = severities[positive_idx].item()
+
+            # --------------------------------------------------
+            # Validate SALR contract
+            # --------------------------------------------------
+
+            # Anchor and negative must be same speaker.
+            if anchor_spk != negative_spk:
                 continue
 
-            neg_idx = random.choice(neg_pool)
-            pos_idx = random.choice(pos_pool)
+            # Anchor and negative must be different words.
+            if anchor_word == negative_word:
+                continue
 
-            anchors.append(embeddings[i])
-            negatives.append(embeddings[neg_idx])
-            positives.append(embeddings[pos_idx])
+            # Negative and positive must contain the same word B.
+            if negative_word != positive_word:
+                continue
 
+            # Anchor and positive must be different speakers.
+            if anchor_spk == positive_spk:
+                continue
+
+            # All three samples must have the same severity.
+            if not (
+                    anchor_sev
+                    == negative_sev
+                    == positive_sev
+            ):
+                continue
+
+            # --------------------------------------------------
+            # Valid triplet
+            # --------------------------------------------------
+
+            anchors.append(embeddings[anchor_idx])
+            negatives.append(embeddings[negative_idx])
+            positives.append(embeddings[positive_idx])
+
+        # No valid triplets in batch.
         if not anchors:
             return None, None, None
 
@@ -598,12 +667,20 @@ def loso_cv(
                 print(f"  Skip {test_spk}: no uncommon test samples.")
                 continue
 
+
+
             train_ds = UASpeechDataset(train_samples, processor)
             test_ds  = UASpeechDataset(test_samples,  processor)
 
+            # Instantiate the custom sampler
+            triplet_sampler = BalancedTripletBatchSampler(
+                dataset_samples=train_samples,
+                batch_size=4,
+            )
+
             train_loader = DataLoader(
-                train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                collate_fn=collate_fn, drop_last=False,
+                train_ds, batch_sampler=triplet_sampler,
+                collate_fn=collate_fn, drop_last=False
             )
             test_loader = DataLoader(
                 test_ds, batch_size=BATCH_SIZE, shuffle=False,
@@ -791,7 +868,205 @@ def load_ua_speech(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 7.  Entry point
+# 7.  Custom Batch Sampling
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+from collections import defaultdict
+import random
+
+
+class BalancedTripletBatchSampler(BatchSampler):
+    """
+    Batch sampler for SALR.
+
+    CONTRACT
+    --------
+    Every 3 consecutive samples in a batch form exactly one SALR triplet:
+
+        [Anchor, Negative, Positive]
+
+    Anchor:
+        Word A, Speaker X
+
+    Negative:
+        Word B, Speaker X
+
+    Positive:
+        Word B, Speaker Y
+
+    Required:
+        A != B
+        X != Y
+        severity(X) == severity(Y)
+
+    Additionally:
+        the negative and positive must contain the SAME word B.
+
+    Therefore:
+
+        batch_size must be a multiple of 3.
+
+    The sampler guarantees that every generated triplet satisfies
+    the above conditions, so _build_triplets() does not need to
+    search for or repair triplets.
+    """
+
+    def __init__(
+        self,
+        dataset_samples: list,
+        batch_size: int = 3,
+    ):
+        if batch_size % 3 != 0:
+            raise ValueError(
+                "batch_size must be a multiple of 3."
+            )
+
+        self.batch_size = batch_size
+
+        # --------------------------------------------------
+        # Dataset index:
+        #
+        # severity
+        #   └── speaker
+        #         └── word
+        #               └── [dataset indices]
+        # --------------------------------------------------
+
+        self.tree = defaultdict(
+            lambda: defaultdict(
+                lambda: defaultdict(list)
+            )
+        )
+
+        for idx, sample in enumerate(dataset_samples):
+            sev = sample["severity"]
+            spk = sample["speaker_id"]
+            word = sample["word_id"]
+
+            self.tree[sev][spk][word].append(idx)
+
+        # --------------------------------------------------
+        # Find all valid (severity, speaker X, speaker Y,
+        # word A, word B) combinations.
+        #
+        # These combinations are guaranteed to produce
+        # a valid SALR triplet.
+        # --------------------------------------------------
+
+        self.valid_triplets = []
+
+        for sev, spk_dict in self.tree.items():
+
+            speakers = list(spk_dict.keys())
+
+            for spk_x in speakers:
+
+                words_x = set(spk_dict[spk_x].keys())
+
+                # Speaker X needs at least two different words:
+                #
+                # Word A -> anchor
+                # Word B -> negative
+                #
+                if len(words_x) < 2:
+                    continue
+
+                for spk_y in speakers:
+
+                    if spk_y == spk_x:
+                        continue
+
+                    words_y = set(spk_dict[spk_y].keys())
+
+                    # B must exist for BOTH speakers.
+                    common_words = words_x & words_y
+
+                    for word_b in common_words:
+
+                        # A must be different from B.
+                        possible_word_a = words_x - {word_b}
+
+                        for word_a in possible_word_a:
+
+                            self.valid_triplets.append(
+                                (
+                                    sev,
+                                    spk_x,
+                                    spk_y,
+                                    word_a,
+                                    word_b,
+                                )
+                            )
+
+        if not self.valid_triplets:
+            raise RuntimeError(
+                "Could not find any valid SALR triplets."
+            )
+
+        self.num_batches = (
+            len(dataset_samples) // batch_size
+        )
+
+    def __iter__(self):
+
+        num_triplets_per_batch = self.batch_size // 3
+
+        for _ in range(self.num_batches):
+
+            batch_indices = []
+
+            for _ in range(num_triplets_per_batch):
+
+                # --------------------------------------------------
+                # Select a combination for which a valid triplet
+                # is guaranteed to exist.
+                # --------------------------------------------------
+
+                (
+                    sev,
+                    spk_x,
+                    spk_y,
+                    word_a,
+                    word_b,
+                ) = random.choice(self.valid_triplets)
+
+                # --------------------------------------------------
+                # Select concrete dataset samples.
+                # --------------------------------------------------
+
+                anchor_idx = random.choice(
+                    self.tree[sev][spk_x][word_a]
+                )
+
+                negative_idx = random.choice(
+                    self.tree[sev][spk_x][word_b]
+                )
+
+                positive_idx = random.choice(
+                    self.tree[sev][spk_y][word_b]
+                )
+
+                # --------------------------------------------------
+                # CONTRACT:
+                #
+                # [Anchor, Negative, Positive]
+                # --------------------------------------------------
+
+                batch_indices.extend([
+                    anchor_idx,
+                    negative_idx,
+                    positive_idx,
+                ])
+
+            yield batch_indices
+
+    def __len__(self) -> int:
+        return self.num_batches
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 8.  Entry point
 # ──────────────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
