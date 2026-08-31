@@ -1010,13 +1010,11 @@ class BalancedTripletBatchSampler(BatchSampler):
 
     def __iter__(self):
 
-        num_triplets_per_batch = self.batch_size // 3
-
         for _ in range(self.num_batches):
 
             batch_indices = []
 
-            for _ in range(num_triplets_per_batch):
+            for _ in range(self.batch_size):
 
                 # --------------------------------------------------
                 # Select a combination for which a valid triplet
