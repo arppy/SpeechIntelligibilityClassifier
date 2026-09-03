@@ -133,35 +133,66 @@ def collate_fn(batch: List[Dict]) -> Dict:
     }
 class SALRTripletCollator:
     """
-    Takes the DataLoader's fetched anchor items, resolves each into a full
-    (Anchor, Negative, Positive) triplet, and fetches/processes the extra
-    negative & positive waveforms itself. If an anchor can't form a triplet
-    (e.g. a speaker with only one word, or no severity-matched partner),
-    it draws a fresh replacement anchor and retries — bounded by
-    max_resample_attempts — so every batch still has exactly batch_size
-    resolved triplets.
+    Turns a batch of raw anchor indices into a full (Anchor, Negative,
+    Positive) triplet batch: for each anchor, finds a same-speaker,
+    different-word "negative" and a different-speaker (same severity),
+    same-word-as-negative "positive", then fetches and processes their
+    waveforms. If an anchor can't form a triplet, draws a fresh
+    replacement and retries.
+
+    Returned batches are laid out [A, N, P, A, N, P, ...] — this ordering
+    convention is what train_one_epoch_salr splits back out before
+    calling SALRLoss.
     """
 
     def __init__(self, dataset: "UASpeechDataset", max_resample_attempts: int = 50):
         self.dataset = dataset
-        self.tree = SALRLoss.build_tree(dataset.samples)
+        self.tree = self._build_tree(dataset.samples)
         self.max_resample_attempts = max_resample_attempts
+
+    @staticmethod
+    def _build_tree(dataset_samples: List[Dict]) -> Dict:
+        """severity -> speaker -> word -> [indices]."""
+        tree = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+        for idx, sample in enumerate(dataset_samples):
+            tree[sample["severity"]][sample["speaker_id"]][sample["word_id"]].append(idx)
+        return tree
+
+    def _find_triplet(self, anchor_idx: int) -> Optional[Tuple[int, int, int]]:
+        """Resolve one anchor into (anchor_idx, negative_idx, positive_idx), or None."""
+        anchor = self.dataset.samples[anchor_idx]
+        sev, spk_x, word_a = anchor["severity"], anchor["speaker_id"], anchor["word_id"]
+
+        negative_candidates = []
+        for word_b, indices in self.tree[sev][spk_x].items():
+            if word_b != word_a:
+                negative_candidates.extend((word_b, i) for i in indices)
+        random.shuffle(negative_candidates)
+
+        for word_b, negative_idx in negative_candidates:
+            positive_candidates = []
+            for spk_y, word_dict in self.tree[sev].items():
+                if spk_y != spk_x and word_b in word_dict:
+                    positive_candidates.extend(word_dict[word_b])
+            if positive_candidates:
+                return anchor_idx, negative_idx, random.choice(positive_candidates)
+
+        return None
+
+    def _resolve(self, anchor_idx: int) -> Tuple[int, int, int]:
+        for _ in range(self.max_resample_attempts):
+            triplet = self._find_triplet(anchor_idx)
+            if triplet is not None:
+                return triplet
+            anchor_idx = random.randrange(len(self.dataset.samples))
+        raise RuntimeError(f"Could not resolve a triplet after {self.max_resample_attempts} attempts.")
 
     def __call__(self, batch_items: List[Dict]) -> Dict:
         resolved_indices = []
         for item in batch_items:
             resolved_indices.extend(self._resolve(item["idx"]))
         items = [self.dataset[i] for i in resolved_indices]
-        return collate_fn(items)   # reuse the existing padding/stacking logic
-
-    def _resolve(self, anchor_idx: int) -> Tuple[int, int, int]:
-        for _ in range(self.max_resample_attempts):
-            triplets = SALRLoss.find_triplet_indices([anchor_idx], self.dataset.samples, tree=self.tree)
-            if triplets:
-                return triplets[0]
-            anchor_idx = random.randrange(len(self.dataset.samples))  # try a fresh anchor
-        raise RuntimeError(f"Could not resolve a triplet after {self.max_resample_attempts} attempts.")
-
+        return collate_fn(items)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 2.  Model Architecture
@@ -286,30 +317,18 @@ class DysarthriaClassifier(nn.Module):
 
 class SALRLoss(nn.Module):
     r"""
-    Speaker-Agnostic Latent Regularisation loss.
+    Speaker-Agnostic Latent Regularisation loss (§ 2.3, Eq. 1).
 
-    Combined objective (§ 2.3):
+        L = α · L_CE(anchor_logits, anchor_severities)
+          + λ · L_triplet(anchor_emb, positive_emb, negative_emb)
 
-        L = α · L_CE  +  λ · L_triplet
+    α follows a warm-up schedule: 0 for the first `warmup_steps` gradient
+    steps, then 1. L_triplet uses L2 distance with margin `margin`.
 
-    where
-        λ = 0.01  (LAMBDA)
-        α = 0     for the first 3 000 gradient steps  (warm-up phase)
-        α = 1     thereafter
-
-    Triplet construction from a single batch (Eq. 1):
-
-        Anchor   E_AX : utterance of word A by speaker X
-        Positive E_BY : utterance of word B by speaker Y ≠ X,
-                        with the *same* severity as speaker X
-        Negative E_BX : utterance of word B by the *same* speaker X
-                        (different word from the anchor)
-
-    Intuition: force  d(E_AX, E_BX) > d(E_AX, E_BY) + m  so that
-    embeddings separate by severity rather than by speaker identity.
-
-    Distance metric: L2 Euclidean  (p = 2 in TripletMarginLoss)
-    Margin:  m = 0.05
+    This module has no knowledge of how the anchor/negative/positive
+    tensors were chosen or assembled — that happens upstream in the data
+    pipeline (SALRTripletCollator) and in train_one_epoch_salr, which
+    splits the model's batched outputs before calling this loss.
     """
 
     def __init__(
@@ -324,230 +343,31 @@ class SALRLoss(nn.Module):
         self.ce           = nn.CrossEntropyLoss()
         self.triplet      = nn.TripletMarginLoss(margin=margin, p=2)
 
-    # ------------------------------------------------------------------
     def _alpha(self, step: int) -> float:
         """α schedule: 0 during warm-up, 1 afterwards."""
         return 0.0 if step < self.warmup_steps else 1.0
 
-    # ------------------------------------------------------------------
-    @staticmethod
-    def build_tree(dataset_samples):
-        """severity -> speaker -> word -> [indices]. Build once, reuse across calls."""
-        tree = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-        for idx, sample in enumerate(dataset_samples):
-            tree[sample["severity"]][sample["speaker_id"]][sample["word_id"]].append(idx)
-        return tree
-
-    @staticmethod
-    def find_triplet_indices(anchor_indices, dataset_samples, tree=None):
-        """... same docstring ...
-        `tree`: optional prebuilt index from build_tree(); pass it whenever this
-        is called more than once against the same dataset_samples (e.g. once
-        per resolve call) to avoid rebuilding it from scratch every time.
-        """
-        if tree is None:
-            tree = SALRLoss.build_tree(dataset_samples)
-
-        triplets = []
-        for anchor_idx in anchor_indices:
-            anchor = dataset_samples[anchor_idx]
-            sev, spk_x, word_a = anchor["severity"], anchor["speaker_id"], anchor["word_id"]
-
-            negative_candidates = []
-            for word_b, indices in tree[sev][spk_x].items():
-                if word_b == word_a:
-                    continue
-                negative_candidates.extend((word_b, i) for i in indices)
-            if not negative_candidates:
-                continue
-
-            random.shuffle(negative_candidates)
-            for word_b, negative_idx in negative_candidates:
-                positive_candidates = []
-                for spk_y, word_dict in tree[sev].items():
-                    if spk_y == spk_x or word_b not in word_dict:
-                        continue
-                    positive_candidates.extend(word_dict[word_b])
-                if positive_candidates:
-                    triplets.append((anchor_idx, negative_idx, random.choice(positive_candidates)))
-                    break
-
-        return triplets
-
-
-
-    def _build_triplets(
-            self,
-            embeddings: torch.Tensor,  # (B, D)
-            severities: torch.Tensor,  # (B,)
-            speaker_ids: List[str],
-            word_ids: List[str],
-    ) -> Tuple[
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor]
-    ]:
-        """
-        Build SALR triplets from a batch produced by
-        BalancedTripletBatchSampler.
-
-        CONTRACT
-        --------
-        Every 3 consecutive samples have the structure:
-
-            [Anchor, Negative, Positive]
-
-        Anchor:
-            Word A, Speaker X
-
-        Negative:
-            Word B, Speaker X
-
-        Positive:
-            Word B, Speaker Y
-
-        Required:
-            A != B
-            X != Y
-            severity(A,X) == severity(B,X) == severity(B,Y)
-
-        The sampler guarantees this structure.
-        This function only validates the contract and converts
-        the batch into tensors suitable for TripletMarginLoss.
-        """
-
-        B = embeddings.size(0)
-
-        # A valid SALR batch must consist of complete triplets.
-        if B % 3 != 0:
-            return None, None, None
-
-        anchors = []
-        positives = []
-        negatives = []
-
-        num_triplets = B // 3
-
-        for triplet_idx in range(num_triplets):
-
-            start = triplet_idx * 3
-
-            anchor_idx = start
-            negative_idx = start + 1
-            positive_idx = start + 2
-
-            # --------------------------------------------------
-            # Read metadata
-            # --------------------------------------------------
-
-            anchor_spk = speaker_ids[anchor_idx]
-            negative_spk = speaker_ids[negative_idx]
-            positive_spk = speaker_ids[positive_idx]
-
-            anchor_word = word_ids[anchor_idx]
-            negative_word = word_ids[negative_idx]
-            positive_word = word_ids[positive_idx]
-
-            anchor_sev = severities[anchor_idx].item()
-            negative_sev = severities[negative_idx].item()
-            positive_sev = severities[positive_idx].item()
-
-            # --------------------------------------------------
-            # Validate SALR contract
-            # --------------------------------------------------
-
-            # Anchor and negative must be same speaker.
-            if anchor_spk != negative_spk:
-                continue
-
-            # Anchor and negative must be different words.
-            if anchor_word == negative_word:
-                continue
-
-            # Negative and positive must contain the same word B.
-            if negative_word != positive_word:
-                continue
-
-            # Anchor and positive must be different speakers.
-            if anchor_spk == positive_spk:
-                continue
-
-            # All three samples must have the same severity.
-            if not (
-                    anchor_sev
-                    == negative_sev
-                    == positive_sev
-            ):
-                continue
-
-            # --------------------------------------------------
-            # Valid triplet
-            # --------------------------------------------------
-
-            anchors.append(embeddings[anchor_idx])
-            negatives.append(embeddings[negative_idx])
-            positives.append(embeddings[positive_idx])
-
-        # No valid triplets in batch.
-        if not anchors:
-            return None, None, None
-
-        return (
-            torch.stack(anchors),
-            torch.stack(positives),
-            torch.stack(negatives),
-        )
-
-    # ------------------------------------------------------------------
     def forward(
-            self,
-            logits,
-            embeddings,
-            severities,
-            step,
-    ):
+        self,
+        anchor_logits:     torch.Tensor,  # (N, num_classes)
+        anchor_severities: torch.Tensor,  # (N,)
+        anchor_emb:        torch.Tensor,  # (N, D)
+        positive_emb:      torch.Tensor,  # (N, D)
+        negative_emb:      torch.Tensor,  # (N, D)
+        step:              int,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
         alpha = self._alpha(step)
 
-        # --------------------------------------------------
-        # CE: csak az anchorok
-        # --------------------------------------------------
+        l_ce      = self.ce(anchor_logits, anchor_severities)
+        l_triplet = self.triplet(anchor_emb, positive_emb, negative_emb)
 
-        anchor_logits = logits[::3]
-        anchor_severities = severities[::3]
-
-        l_ce = self.ce(
-            anchor_logits,
-            anchor_severities
-        )
-
-        # --------------------------------------------------
-        # Triplet loss: mind a 12 embedding
-        # --------------------------------------------------
-
-        anchor_emb = embeddings[::3]
-        negative_emb = embeddings[1::3]
-        positive_emb = embeddings[2::3]
-
-        l_triplet = self.triplet(
-            anchor_emb,
-            positive_emb,
-            negative_emb
-        )
-
-        # --------------------------------------------------
-        # Combined SALR loss
-        # --------------------------------------------------
-
-        loss = (
-                alpha * l_ce
-                + self.lam * l_triplet
-        )
+        loss = alpha * l_ce + self.lam * l_triplet
 
         return loss, {
-            "loss": loss.item(),
-            "loss_ce": l_ce.item(),
+            "loss":         loss.item(),
+            "loss_ce":      l_ce.item(),
             "loss_triplet": l_triplet.item(),
-            "alpha": alpha,
+            "alpha":        alpha,
         }
 
 
@@ -581,14 +401,23 @@ def train_one_epoch_salr(
     total = 0.0
 
     for batch in loader:
-
         iv   = batch["input_values"].to(device)
         mask = batch["attention_mask"].to(device)
         sev  = batch["severity"].to(device)
 
         logits, emb = model(iv, mask)
-        loss, info  = criterion(
-            logits, emb, sev,
+
+        # SALRTripletCollator lays batches out as [A, N, P, A, N, P, ...];
+        # unpack that structure here, before calling the loss.
+        anchor_logits     = logits[0::3]
+        anchor_severities = sev[0::3]
+        anchor_emb        = emb[0::3]
+        negative_emb      = emb[1::3]
+        positive_emb      = emb[2::3]
+
+        loss, info = criterion(
+            anchor_logits, anchor_severities,
+            anchor_emb, positive_emb, negative_emb,
             step,
         )
 
