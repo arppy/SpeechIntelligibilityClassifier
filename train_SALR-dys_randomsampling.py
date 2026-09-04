@@ -243,6 +243,7 @@ class DysarthriaClassifier(nn.Module):
     ):
         super().__init__()
         self.wav2vec2   = Wav2Vec2Model.from_pretrained(model_name)
+        self.wav2vec2.gradient_checkpointing_enable()
         hidden_size     = self.wav2vec2.config.hidden_size          # 768
         self.classifier = ClassificationHead(hidden_size, num_classes)
 
