@@ -37,6 +37,7 @@ from sklearn.linear_model import LogisticRegression
 
 from collections import defaultdict
 from torch.utils.data import BatchSampler
+from torch.cuda.amp import autocast
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants  (all directly from the paper)
@@ -404,24 +405,19 @@ def train_one_epoch_salr(
         iv   = batch["input_values"].to(device)
         mask = batch["attention_mask"].to(device)
         sev  = batch["severity"].to(device)
-
-        logits, emb = model(iv, mask)
-
-        # SALRTripletCollator lays batches out as [A, N, P, A, N, P, ...];
-        # unpack that structure here, before calling the loss.
-        anchor_logits     = logits[0::3]
-        anchor_severities = sev[0::3]
-        anchor_emb        = emb[0::3]
-        negative_emb      = emb[1::3]
-        positive_emb      = emb[2::3]
-
-        loss, info = criterion(
-            anchor_logits, anchor_severities,
-            anchor_emb, positive_emb, negative_emb,
-            step,
-        )
-
         optimizer.zero_grad()
+        with autocast(dtype=torch.bfloat16):  # Use torch.bfloat16 if running on Ampere/Ada GPUs
+            logits, emb = model(iv, mask)
+
+            # SALRTripletCollator lays batches out as [A, N, P, A, N, P, ...];
+            # unpack that structure here, before calling the loss.
+            anchor_logits     = logits[0::3]
+            anchor_severities = sev[0::3]
+            anchor_emb        = emb[0::3]
+            negative_emb      = emb[1::3]
+            positive_emb      = emb[2::3]
+
+            loss, info = criterion(anchor_logits, anchor_severities, anchor_emb, positive_emb, negative_emb, step)
         loss.backward()
         optimizer.step()
 
