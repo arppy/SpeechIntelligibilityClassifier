@@ -397,35 +397,52 @@ def train_one_epoch_salr(
     criterion: SALRLoss,
     device:    torch.device,
     step:      int,
-) -> Tuple[float, int]:
-    """SALR multi-task training epoch. Returns (mean_loss, updated_step)."""
+) -> Tuple[Dict[str, float], int]:
+    """SALR multi-task training epoch. Returns (epoch_stats, updated_step),
+    where epoch_stats has mean total/CE/triplet loss and the alpha value
+    active at the end of the epoch."""
     model.train()
-    total = 0.0
+    totals = defaultdict(float)
+    n_batches = 0
 
     for batch in loader:
         iv   = batch["input_values"].to(device)
         mask = batch["attention_mask"].to(device)
         sev  = batch["severity"].to(device)
         optimizer.zero_grad()
-        with autocast(device_type=device.type, dtype=torch.bfloat16):  # Use torch.bfloat16 if running on Ampere/Ada GPUs
+
+        with autocast(device_type=device.type, dtype=torch.bfloat16):
             logits, emb = model(iv, mask)
 
-            # SALRTripletCollator lays batches out as [A, N, P, A, N, P, ...];
-            # unpack that structure here, before calling the loss.
             anchor_logits     = logits[0::3]
             anchor_severities = sev[0::3]
             anchor_emb        = emb[0::3]
             negative_emb      = emb[1::3]
             positive_emb      = emb[2::3]
 
-            loss, info = criterion(anchor_logits, anchor_severities, anchor_emb, positive_emb, negative_emb, step)
+            loss, info = criterion(
+                anchor_logits, anchor_severities,
+                anchor_emb, positive_emb, negative_emb,
+                step,
+            )
+
         loss.backward()
         optimizer.step()
 
-        total += info["loss"]
-        step  += 1
+        totals["loss"]         += info["loss"]
+        totals["loss_ce"]      += info["loss_ce"]
+        totals["loss_triplet"] += info["loss_triplet"]
+        totals["alpha"] = info["alpha"]   # last value, not summed
+        n_batches += 1
+        step += 1
 
-    return total / max(len(loader), 1), step
+    epoch_stats = {
+        "loss":         totals["loss"] / max(n_batches, 1),
+        "loss_ce":      totals["loss_ce"] / max(n_batches, 1),
+        "loss_triplet": totals["loss_triplet"] / max(n_batches, 1),
+        "alpha":        totals["alpha"],
+    }
+    return epoch_stats, step
 
 
 def train_one_epoch_baseline(
@@ -532,10 +549,9 @@ def loso_cv(
     num_epochs:       int  = 30,
     n_runs:           int  = 5,
     use_salr:         bool = True,
+    checkpoint_dir:   str  = "./checkpoints",
 ) -> Dict[str, List[float]]:
-    """
-    ... (docstring unchanged) ...
-    """
+    """... (docstring unchanged, extend with checkpoint_dir note) ..."""
     results: Dict[str, List[float]] = {"accuracy": [], "f1": []}
 
     by_speaker: Dict[str, List[Dict]] = {s: [] for s in dysarthric_spks}
@@ -549,7 +565,6 @@ def loso_cv(
         print(f"\n── Run {run + 1}/{n_runs} ──────────────────────────────")
 
         for test_spk in dysarthric_spks:
-            # ── Split ─────────────────────────────────────────────────
             train_samples = [
                 s for s in all_samples
                 if s["speaker_id"] != test_spk and s["is_common"]
@@ -571,50 +586,77 @@ def loso_cv(
                 collate_fn=collate_fn,
             )
 
-            # ── Model ────────────────────────────────────────────────
             model     = DysarthriaClassifier(model_name).to(device)
             optimizer = build_optimizer(model)
+            ckpt_path = checkpoint_path(checkpoint_dir, run, test_spk, use_salr)
+            checkpoint = load_checkpoint(ckpt_path, model, optimizer, device)
+            already_done = checkpoint is not None and checkpoint["epoch"] >= num_epochs
 
             if use_salr:
-                # Sampler only picks 4 random anchor indices — it knows
-                # nothing about triplets. The collator resolves each anchor
-                # into a full (Anchor, Negative, Positive) triple and fetches
-                # the extra waveforms itself.
-                anchor_sampler = RandomBatchSampler(
-                    dataset_size=len(train_samples),
-                    batch_size=4,
-                )
-                salr_collator = SALRTripletCollator(train_ds)
+                if already_done:
+                    print(f"  {test_spk:<8s} | already completed "
+                          f"({checkpoint['epoch']}/{num_epochs} epochs) — skipping training.")
+                else:
+                    anchor_sampler = RandomBatchSampler(dataset_size=len(train_samples), batch_size=4)
+                    salr_collator  = SALRTripletCollator(train_ds)
+                    train_loader   = DataLoader(train_ds, batch_sampler=anchor_sampler, collate_fn=salr_collator)
+                    criterion      = SALRLoss()
 
-                train_loader = DataLoader(
-                    train_ds,
-                    batch_sampler=anchor_sampler,
-                    collate_fn=salr_collator,
-                )
+                    start_epoch  = checkpoint["epoch"] if checkpoint else 0
+                    step         = checkpoint["step"] if checkpoint else 0
+                    loss_history = checkpoint["loss_history"] if checkpoint else []
 
-                criterion = SALRLoss()
-                step = 0
-                for epoch in range(num_epochs):
-                    loss, step = train_one_epoch_salr(
-                        model, train_loader, optimizer, criterion, device, step
-                    )
-                    if (epoch + 1) % 10 == 0:
-                        print(f"    epoch {epoch+1:3d}  loss={loss:.4f}  "
-                              f"alpha={criterion._alpha(step):.1f}")
+                    for epoch in range(start_epoch, num_epochs):
+                        epoch_stats, step = train_one_epoch_salr(
+                            model, train_loader, optimizer, criterion, device, step
+                        )
+                        loss_history.append({"epoch": epoch + 1, **epoch_stats})
+
+                        print(f"    epoch {epoch+1:3d}/{num_epochs}  "
+                              f"loss={epoch_stats['loss']:.4f}  "
+                              f"ce={epoch_stats['loss_ce']:.4f}  "
+                              f"triplet={epoch_stats['loss_triplet']:.4f}  "
+                              f"alpha={epoch_stats['alpha']:.1f}")
+
+                        is_last = (epoch + 1) == num_epochs
+                        if (epoch + 1) % CHECKPOINT_EVERY == 0 or is_last:
+                            save_checkpoint(
+                                ckpt_path, model, optimizer,
+                                epoch=epoch + 1, num_epochs=num_epochs, step=step,
+                                run=run, test_spk=test_spk, use_salr=True,
+                                loss_history=loss_history,
+                            )
             else:
-                # Baseline: plain shuffled batches, no triplet structure at all.
-                train_loader = DataLoader(
-                    train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                    collate_fn=collate_fn,
-                )
-
-                criterion_base = nn.CrossEntropyLoss()
-                for epoch in range(num_epochs):
-                    loss = train_one_epoch_baseline(
-                        model, train_loader, optimizer, criterion_base, device
+                if already_done:
+                    print(f"  {test_spk:<8s} | already completed "
+                          f"({checkpoint['epoch']}/{num_epochs} epochs) — skipping training.")
+                else:
+                    train_loader = DataLoader(
+                        train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn,
                     )
+                    criterion_base = nn.CrossEntropyLoss()
 
-            # ── Eval ─────────────────────────────────────────────────
+                    start_epoch  = checkpoint["epoch"] if checkpoint else 0
+                    loss_history = checkpoint["loss_history"] if checkpoint else []
+
+                    for epoch in range(start_epoch, num_epochs):
+                        loss = train_one_epoch_baseline(
+                            model, train_loader, optimizer, criterion_base, device
+                        )
+                        loss_history.append({"epoch": epoch + 1, "loss": loss})
+                        print(f"    epoch {epoch+1:3d}/{num_epochs}  loss={loss:.4f}")
+
+                        is_last = (epoch + 1) == num_epochs
+                        if (epoch + 1) % CHECKPOINT_EVERY == 0 or is_last:
+                            save_checkpoint(
+                                ckpt_path, model, optimizer,
+                                epoch=epoch + 1, num_epochs=num_epochs, step=0,
+                                run=run, test_spk=test_spk, use_salr=False,
+                                loss_history=loss_history,
+                            )
+
+            # ── Eval (unchanged — runs regardless of whether we just
+            #    trained or loaded a completed checkpoint) ─────────────
             metrics = evaluate(model, test_loader, device)
             run_acc.append(metrics["accuracy"])
             run_f1.append(metrics["f1"])
@@ -771,6 +813,93 @@ def load_ua_speech(
           f"({len(dysarthric_spks)} dysarthric).")
     return samples, dysarthric_spks
 
+import time
+
+# ─── Checkpointing ─────────────────────────────────────────────────────────
+
+CHECKPOINT_EVERY = 5   # save every 5 epochs
+
+
+def checkpoint_path(ckpt_dir: str, run: int, test_spk: str, use_salr: bool) -> str:
+    """One file per (run, held-out speaker, model type) — the natural unit
+    of parallel work: each LOSO fold is an independent model, so each
+    machine can safely own a disjoint set of these files with zero
+    coordination beyond "don't pick a fold someone else already claimed"."""
+    os.makedirs(ckpt_dir, exist_ok=True)
+    tag = "salr" if use_salr else "baseline"
+    return os.path.join(ckpt_dir, f"run{run}_{test_spk}_{tag}.pt")
+
+
+def save_checkpoint(
+    path:         str,
+    model:        nn.Module,
+    optimizer:    torch.optim.Optimizer,
+    epoch:        int,
+    num_epochs:   int,
+    step:         int,
+    run:          int,
+    test_spk:     str,
+    use_salr:     bool,
+    loss_history: List[Dict],
+) -> None:
+    """Persist full training state so this fold can resume on any machine."""
+    checkpoint = {
+        "model_state_dict":     model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "epoch":                epoch,
+        "step":                 step,
+        "run":                  run,
+        "test_spk":             test_spk,
+        "use_salr":             use_salr,
+        "loss_history":         loss_history,
+        # RNG states so a resumed fold draws the same triplets / batch
+        # orders it would have drawn had it never stopped.
+        "python_random_state":  random.getstate(),
+        "numpy_random_state":   np.random.get_state(),
+        "torch_random_state":   torch.get_rng_state(),
+        "timestamp":            time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    # Write to a temp file then atomically rename, so a crash mid-write
+    # (or two machines writing at once) never leaves a half-written file
+    # that a resuming machine would try to load.
+    tmp_path = path + ".tmp"
+    torch.save(checkpoint, tmp_path)
+    os.replace(tmp_path, path)
+
+    print(f"    [checkpoint] saved epoch {epoch:3d}/{{num_epochs}} → {path}  "
+          f"(loss={loss_history[-1].get('loss', float('nan')):.4f})")
+
+
+def load_checkpoint(
+    path:      str,
+    model:     nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device:    torch.device,
+) -> Optional[Dict]:
+    """Load training state if a checkpoint exists; returns None if this
+    fold hasn't been started yet, so the caller trains from scratch."""
+    if not os.path.exists(path):
+        return None
+
+    # weights_only=False: recent torch versions default to True, which
+    # rejects the RNG-state tuples and loss_history list we saved above
+    # (they aren't tensors). Safe here since these are our own local files,
+    # not checkpoints downloaded from somewhere untrusted.
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    random.setstate(checkpoint["python_random_state"])
+    np.random.set_state(checkpoint["numpy_random_state"])
+    torch.set_rng_state(checkpoint["torch_random_state"].cpu())
+
+    print(f"    [checkpoint] resumed {checkpoint['test_spk']} from epoch "
+          f"{checkpoint['epoch']:3d} (saved {checkpoint['timestamp']}) ← {path}")
+
+    return checkpoint
+
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 7.  Custom Batch Sampling
@@ -798,6 +927,7 @@ class RandomBatchSampler(BatchSampler):
         return self.num_batches
 
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 8.  Entry point
 # ──────────────────────────────────────────────────────────────────────────────
@@ -823,6 +953,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device",      default=None,
                    help="'cuda', 'mps', or 'cpu'. Auto-detected if omitted.")
     p.add_argument("--seed",        type=int, default=42)
+    p.add_argument("--checkpoint_dir", default="./checkpoints",
+                   help="Directory for per-fold checkpoints (shared filesystem "
+                        "if running multiple machines in parallel).")
     return p.parse_args()
 
 
@@ -853,14 +986,15 @@ def main() -> None:
     samples, dysarthric_spks = load_ua_speech(args.data_root, args.metadata)
 
     loso_cv(
-        all_samples     = samples,
-        dysarthric_spks = dysarthric_spks,
-        processor       = processor,
-        device          = device,
-        model_name      = args.model_name,
-        num_epochs      = args.epochs,
-        n_runs          = args.runs,
-        use_salr        = not args.baseline,
+        all_samples=samples,
+        dysarthric_spks=dysarthric_spks,
+        processor=processor,
+        device=device,
+        model_name=args.model_name,
+        num_epochs=args.epochs,
+        n_runs=args.runs,
+        use_salr=not args.baseline,
+        checkpoint_dir=args.checkpoint_dir,
     )
 
 
