@@ -550,8 +550,11 @@ def loso_cv(
     n_runs:           int  = 5,
     use_salr:         bool = True,
     checkpoint_dir:   str  = "./checkpoints",
+    claim_ttl:        int  = 86400,
+    claim_dir:        Optional[str] = None,
+    base_seed:        int  = 42,  # MODOSITAS: Alap seed fogadasa
 ) -> Dict[str, List[float]]:
-    """... (docstring unchanged, extend with checkpoint_dir note) ..."""
+    """LOSO CV with per-fold claiming for concurrent workers."""
     results: Dict[str, List[float]] = {"accuracy": [], "f1": []}
 
     by_speaker: Dict[str, List[Dict]] = {s: [] for s in dysarthric_spks}
@@ -560,117 +563,131 @@ def loso_cv(
         if spk in by_speaker:
             by_speaker[spk].append(sample)
 
-    for run in range(n_runs):
-        run_acc, run_f1 = [], []
-        print(f"\n── Run {run + 1}/{n_runs} ──────────────────────────────")
+    tasks = [(r, s) for r in range(n_runs) for s in dysarthric_spks]
 
-        for test_spk in dysarthric_spks:
-            train_samples = [
-                s for s in all_samples
-                if s["speaker_id"] != test_spk and s["is_common"]
-            ]
-            test_samples = [
-                s for s in by_speaker[test_spk]
-                if not s["is_common"]
-            ]
+    per_run_acc = {r: [] for r in range(n_runs)}
+    per_run_f1  = {r: [] for r in range(n_runs)}
 
-            if not test_samples:
-                print(f"  Skip {test_spk}: no uncommon test samples.")
-                continue
+    claim_storage_dir = claim_dir if claim_dir is not None else checkpoint_dir
 
-            train_ds = UASpeechDataset(train_samples, processor)
-            test_ds  = UASpeechDataset(test_samples,  processor)
+    print(f"\nStarting LOSO with {len(tasks)} total tasks (runs x speakers)")
 
-            test_loader = DataLoader(
-                test_ds, batch_size=BATCH_SIZE, shuffle=False,
-                collate_fn=collate_fn,
-            )
+    while tasks:
+        run, test_spk = random.choice(tasks)
 
-            model     = DysarthriaClassifier(model_name).to(device)
-            optimizer = build_optimizer(model)
-            ckpt_path = checkpoint_path(checkpoint_dir, run, test_spk, use_salr)
-            checkpoint = load_checkpoint(ckpt_path, model, optimizer, device)
-            already_done = checkpoint is not None and checkpoint["epoch"] >= num_epochs
+        # quick check: if checkpoint exists and is complete, skip
+        ckpt_path = checkpoint_path(checkpoint_dir, run, test_spk, use_salr)
+        if os.path.exists(ckpt_path):
+            try:
+                cp = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+                if cp.get('epoch', 0) >= num_epochs:
+                    tasks.remove((run, test_spk))
+                    continue
+            except Exception:
+                pass
 
-            if use_salr:
-                if already_done:
-                    print(f"  {test_spk:<8s} | already completed "
-                          f"({checkpoint['epoch']}/{num_epochs} epochs) — skipping training.")
-                else:
-                    anchor_sampler = RandomBatchSampler(dataset_size=len(train_samples), batch_size=4)
-                    salr_collator  = SALRTripletCollator(train_ds)
-                    train_loader   = DataLoader(train_ds, batch_sampler=anchor_sampler, collate_fn=salr_collator)
-                    criterion      = SALRLoss()
+        claimed = claim_fold(claim_storage_dir, run, test_spk, use_salr, ttl=claim_ttl)
+        if not claimed:
+            continue
 
-                    start_epoch  = checkpoint["epoch"] if checkpoint else 0
-                    step         = checkpoint["step"] if checkpoint else 0
-                    loss_history = checkpoint["loss_history"] if checkpoint else []
+        try:
+            if os.path.exists(ckpt_path):
+                cp = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+                if cp.get('epoch', 0) >= num_epochs:
+                    release_claim(claim_storage_dir, run, test_spk, use_salr)
+                    tasks.remove((run, test_spk))
+                    continue
+        except Exception:
+            pass
 
-                    for epoch in range(start_epoch, num_epochs):
-                        epoch_stats, step = train_one_epoch_salr(
-                            model, train_loader, optimizer, criterion, device, step
-                        )
-                        loss_history.append({"epoch": epoch + 1, **epoch_stats})
+        # ── MÓDOSÍTÁS: Egyedi, determinisztikus seed beállítása a feladathoz ──
+        spk_idx = dysarthric_spks.index(test_spk)
+        task_seed = base_seed + (run * 1000) + spk_idx
+        random.seed(task_seed)
+        np.random.seed(task_seed)
+        torch.manual_seed(task_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(task_seed)
+        # ─────────────────────────────────────────────────────────────────────
 
-                        print(f"    epoch {epoch+1:3d}/{num_epochs}  "
-                              f"loss={epoch_stats['loss']:.4f}  "
-                              f"ce={epoch_stats['loss_ce']:.4f}  "
-                              f"triplet={epoch_stats['loss_triplet']:.4f}  "
-                              f"alpha={epoch_stats['alpha']:.1f}")
+        train_samples = [s for s in all_samples if s['speaker_id'] != test_spk and s['is_common']]
+        test_samples  = [s for s in by_speaker[test_spk] if not s['is_common']]
 
-                        is_last = (epoch + 1) == num_epochs
-                        if (epoch + 1) % CHECKPOINT_EVERY == 0 or is_last:
-                            save_checkpoint(
-                                ckpt_path, model, optimizer,
-                                epoch=epoch + 1, num_epochs=num_epochs, step=step,
-                                run=run, test_spk=test_spk, use_salr=True,
-                                loss_history=loss_history,
-                            )
+        if not test_samples:
+            print(f"  Skip {test_spk}: no uncommon test samples.")
+            release_claim(claim_storage_dir, run, test_spk, use_salr)
+            tasks.remove((run, test_spk))
+            continue
+
+        train_ds = UASpeechDataset(train_samples, processor)
+        test_ds  = UASpeechDataset(test_samples,  processor)
+
+        test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+
+        model     = DysarthriaClassifier(model_name).to(device)
+        optimizer = build_optimizer(model)
+
+        checkpoint = load_checkpoint(ckpt_path, model, optimizer, device)
+        already_done = checkpoint is not None and checkpoint.get('epoch', 0) >= num_epochs
+
+        if use_salr:
+            if already_done:
+                print(f"  {test_spk:<8s} | already completed ({checkpoint['epoch']}/{num_epochs} epochs) — skipping training.")
             else:
-                if already_done:
-                    print(f"  {test_spk:<8s} | already completed "
-                          f"({checkpoint['epoch']}/{num_epochs} epochs) — skipping training.")
-                else:
-                    train_loader = DataLoader(
-                        train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn,
-                    )
-                    criterion_base = nn.CrossEntropyLoss()
+                anchor_sampler = RandomBatchSampler(dataset_size=len(train_samples), batch_size=4)
+                salr_collator  = SALRTripletCollator(train_ds)
+                train_loader   = DataLoader(train_ds, batch_sampler=anchor_sampler, collate_fn=salr_collator)
+                criterion      = SALRLoss()
 
-                    start_epoch  = checkpoint["epoch"] if checkpoint else 0
-                    loss_history = checkpoint["loss_history"] if checkpoint else []
+                start_epoch  = checkpoint['epoch'] if checkpoint else 0
+                step         = checkpoint['step'] if checkpoint else 0
+                loss_history = checkpoint['loss_history'] if checkpoint else []
 
-                    for epoch in range(start_epoch, num_epochs):
-                        loss = train_one_epoch_baseline(
-                            model, train_loader, optimizer, criterion_base, device
-                        )
-                        loss_history.append({"epoch": epoch + 1, "loss": loss})
-                        print(f"    epoch {epoch+1:3d}/{num_epochs}  loss={loss:.4f}")
+                for epoch in range(start_epoch, num_epochs):
+                    epoch_stats, step = train_one_epoch_salr(model, train_loader, optimizer, criterion, device, step)
+                    loss_history.append({"epoch": epoch + 1, **epoch_stats})
 
-                        is_last = (epoch + 1) == num_epochs
-                        if (epoch + 1) % CHECKPOINT_EVERY == 0 or is_last:
-                            save_checkpoint(
-                                ckpt_path, model, optimizer,
-                                epoch=epoch + 1, num_epochs=num_epochs, step=0,
-                                run=run, test_spk=test_spk, use_salr=False,
-                                loss_history=loss_history,
-                            )
+                    print(f"    epoch {epoch+1:3d}/{num_epochs}  loss={epoch_stats['loss']:.4f}  ce={epoch_stats['loss_ce']:.4f}  triplet={epoch_stats['loss_triplet']:.4f}  alpha={epoch_stats['alpha']:.1f}")
 
-            # ── Eval (unchanged — runs regardless of whether we just
-            #    trained or loaded a completed checkpoint) ─────────────
-            metrics = evaluate(model, test_loader, device)
-            run_acc.append(metrics["accuracy"])
-            run_f1.append(metrics["f1"])
-            print(f"  Test spk {test_spk:<8s} | "
-                  f"Acc {metrics['accuracy']:5.1f}%  F1 {metrics['f1']:5.1f}%")
+                    is_last = (epoch + 1) == num_epochs
+                    if (epoch + 1) % CHECKPOINT_EVERY == 0 or is_last:
+                        save_checkpoint(ckpt_path, model, optimizer, epoch=epoch + 1, num_epochs=num_epochs, step=step, run=run, test_spk=test_spk, use_salr=True, loss_history=loss_history)
+        else:
+            if already_done:
+                print(f"  {test_spk:<8s} | already completed ({checkpoint['epoch']}/{num_epochs} epochs) — skipping training.")
+            else:
+                train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+                criterion_base = nn.CrossEntropyLoss()
 
-        # ── Per-run aggregate ─────────────────────────────────────────
+                start_epoch  = checkpoint['epoch'] if checkpoint else 0
+                loss_history = checkpoint['loss_history'] if checkpoint else []
+
+                for epoch in range(start_epoch, num_epochs):
+                    loss = train_one_epoch_baseline(model, train_loader, optimizer, criterion_base, device)
+                    loss_history.append({"epoch": epoch + 1, "loss": loss})
+                    print(f"    epoch {epoch+1:3d}/{num_epochs}  loss={loss:.4f}")
+
+                    is_last = (epoch + 1) == num_epochs
+                    if (epoch + 1) % CHECKPOINT_EVERY == 0 or is_last:
+                        save_checkpoint(ckpt_path, model, optimizer, epoch=epoch + 1, num_epochs=num_epochs, step=0, run=run, test_spk=test_spk, use_salr=False, loss_history=loss_history)
+
+        metrics = evaluate(model, test_loader, device)
+        per_run_acc[run].append(metrics['accuracy'])
+        per_run_f1[run].append(metrics['f1'])
+        print(f"  Test spk {test_spk:<8s} | Acc {metrics['accuracy']:5.1f}%  F1 {metrics['f1']:5.1f}%")
+
+        release_claim(claim_storage_dir, run, test_spk, use_salr)
+        tasks.remove((run, test_spk))
+
+    for run in range(n_runs):
+        run_acc = per_run_acc.get(run, [])
+        run_f1  = per_run_f1.get(run, [])
         mean_acc = float(np.mean(run_acc)) if run_acc else 0.0
         mean_f1  = float(np.mean(run_f1))  if run_f1  else 0.0
-        results["accuracy"].append(mean_acc)
-        results["f1"].append(mean_f1)
+        results['accuracy'].append(mean_acc)
+        results['f1'].append(mean_f1)
         print(f"  ── Run {run+1} mean: Acc {mean_acc:.1f}%  F1 {mean_f1:.1f}%")
 
-    # ── Final summary ───────────────────────────────────────────────
     acc_arr = np.array(results["accuracy"])
     f1_arr  = np.array(results["f1"])
     print("\n" + "=" * 55)
@@ -860,12 +877,42 @@ def save_checkpoint(
         "timestamp":            time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
+    # Save CUDA RNG state if available (makes resumed training deterministic
+    # for GPU-side randomness). Store as CPU tensors so checkpoints are
+    # portable when loaded on a different device.
+    if torch.cuda.is_available():
+        try:
+            cuda_states = torch.cuda.get_rng_state_all()
+            # move to CPU to make checkpoint loadable on CPU-only hosts
+            checkpoint["cuda_random_states"] = [s.cpu() for s in cuda_states]
+        except Exception:
+            # best-effort; don't fail checkpointing because of cuda state
+            pass
+
     # Write to a temp file then atomically rename, so a crash mid-write
     # (or two machines writing at once) never leaves a half-written file
     # that a resuming machine would try to load.
     tmp_path = path + ".tmp"
     torch.save(checkpoint, tmp_path)
-    os.replace(tmp_path, path)
+
+    # --- MÓDOSÍTÁS A WINDOWS PERMISSIONERROR ELLEN ---
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            os.replace(tmp_path, path)
+            break
+        except PermissionError:
+            if attempt == max_retries - 1:
+                # Ha többszöri próbálkozásra sem sikerül, másolással írjuk felül
+                import shutil
+                shutil.copyfile(tmp_path, path)
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+            else:
+                time.sleep(0.5)  # Várunk fél másodpercet, amíg a fájlzár felszabadul
+    # --------------------------------------------------
 
     print(f"    [checkpoint] saved epoch {epoch:3d}/{{num_epochs}} → {path}  "
           f"(loss={loss_history[-1].get('loss', float('nan')):.4f})")
@@ -894,10 +941,87 @@ def load_checkpoint(
     np.random.set_state(checkpoint["numpy_random_state"])
     torch.set_rng_state(checkpoint["torch_random_state"].cpu())
 
+    # Restore CUDA RNGs if available and present in the checkpoint.
+    if torch.cuda.is_available() and "cuda_random_states" in checkpoint:
+        try:
+            # checkpoint stores CPU tensors; move them to CUDA device(s).
+            cuda_states = [s.cuda() for s in checkpoint["cuda_random_states"]]
+            torch.cuda.set_rng_state_all(cuda_states)
+        except Exception:
+            pass
+
     print(f"    [checkpoint] resumed {checkpoint['test_spk']} from epoch "
           f"{checkpoint['epoch']:3d} (saved {checkpoint['timestamp']}) ← {path}")
 
     return checkpoint
+
+
+# ------------------------- Claim utilities -------------------------------
+def _claim_dir_path(ckpt_dir: str, run: int, test_spk: str, use_salr: bool) -> str:
+    tag = "salr" if use_salr else "baseline"
+    name = f"run{run}_{test_spk}_{tag}.claim"
+    return os.path.join(ckpt_dir, name)
+
+
+def claim_fold(ckpt_dir: str, run: int, test_spk: str, use_salr: bool, ttl: int = 86400) -> bool:
+    """Attempt to claim a fold by creating a claim directory atomically.
+
+    Returns True if claim succeeded, False if already claimed by another worker.
+    If a claim exists but is older than `ttl` seconds it will be removed and
+    replaced (reclaimed).
+    """
+    claim_path = _claim_dir_path(ckpt_dir, run, test_spk, use_salr)
+    # Use atomic file creation (O_CREAT|O_EXCL) for a reliable claim.
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    try:
+        fd = os.open(claim_path, flags)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                fh.write(f"pid={os.getpid()}\n")
+                fh.write(f"ts={time.time()}\n")
+        except Exception:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+        return True
+    except FileExistsError:
+        # existing claim: check staleness
+        try:
+            mtime = os.path.getmtime(claim_path)
+        except Exception:
+            return False
+        if time.time() - mtime > ttl:
+            # stale: try to remove and claim
+            try:
+                os.remove(claim_path)
+            except Exception:
+                return False
+            try:
+                fd = os.open(claim_path, flags)
+                try:
+                    with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                        fh.write(f"pid={os.getpid()}\n")
+                        fh.write(f"ts={time.time()}\n")
+                except Exception:
+                    try:
+                        os.close(fd)
+                    except Exception:
+                        pass
+                return True
+            except Exception:
+                return False
+        return False
+
+
+def release_claim(ckpt_dir: str, run: int, test_spk: str, use_salr: bool) -> None:
+    """Remove the claim directory if it exists. Best-effort cleanup."""
+    claim_path = _claim_dir_path(ckpt_dir, run, test_spk, use_salr)
+    try:
+        if os.path.exists(claim_path):
+            os.remove(claim_path)
+    except Exception:
+        pass
 
 
 
@@ -948,6 +1072,10 @@ def parse_args() -> argparse.Namespace:
                    help="Training epochs per LOSO fold.")
     p.add_argument("--runs",        type=int, default=5,
                    help="Number of LOSO-CV repetitions (paper uses 5).")
+    p.add_argument("--claim-ttl",   type=int, default=86400,
+                   help="Seconds after which an in-progress claim is considered stale.")
+    p.add_argument("--claim-dir",   default=None,
+                   help="Directory to store claim markers (defaults to checkpoint_dir).")
     p.add_argument("--baseline",    action="store_true",
                    help="Run fine-tuned wav2vec2 baseline (cross-entropy only).")
     p.add_argument("--device",      default=None,
@@ -962,7 +1090,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # Reproducibility
+    # Initial Global Reproducibility
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -995,6 +1123,9 @@ def main() -> None:
         n_runs=args.runs,
         use_salr=not args.baseline,
         checkpoint_dir=args.checkpoint_dir,
+        claim_ttl=args.claim_ttl,
+        claim_dir=args.claim_dir,
+        base_seed=args.seed,  # MODOSITAS: Atadjuk az alapszamot
     )
 
 
