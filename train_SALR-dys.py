@@ -45,6 +45,9 @@ from torch.amp import autocast
 
 SAMPLE_RATE        = 16000   # wav2vec 2.0 native sample rate
 NUM_CLASSES        = 4        # very-low / low / medium / high severity
+MAX_CLIP_SECONDS    = 15.6    # clips longer than this are truncated on load,
+                               # so a single long outlier doesn't force every
+                               # other sample in its batch to pad up to it
 
 # § 2.2 – fine-tuning hyper-parameters
 BATCH_SIZE         = 3
@@ -575,30 +578,24 @@ def loso_cv(
     while tasks:
         run, test_spk = random.choice(tasks)
 
-        # quick check: if checkpoint exists and is complete, skip
+        # quick check: if a checkpoint already exists for this fold — whether
+        # it finished all num_epochs or not — skip it rather than resuming.
         ckpt_path = checkpoint_path(checkpoint_dir, run, test_spk, use_salr)
         if os.path.exists(ckpt_path):
-            try:
-                cp = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-                if cp.get('epoch', 0) >= num_epochs:
-                    tasks.remove((run, test_spk))
-                    continue
-            except Exception:
-                pass
+            print(f"  Skip {test_spk} (run {run}): checkpoint already exists — not resuming.")
+            tasks.remove((run, test_spk))
+            continue
 
         claimed = claim_fold(claim_storage_dir, run, test_spk, use_salr, ttl=claim_ttl)
         if not claimed:
             continue
 
-        try:
-            if os.path.exists(ckpt_path):
-                cp = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-                if cp.get('epoch', 0) >= num_epochs:
-                    release_claim(claim_storage_dir, run, test_spk, use_salr)
-                    tasks.remove((run, test_spk))
-                    continue
-        except Exception:
-            pass
+        # re-check after claiming, in case another worker created this fold's
+        # checkpoint while we were in the process of claiming it.
+        if os.path.exists(ckpt_path):
+            release_claim(claim_storage_dir, run, test_spk, use_salr)
+            tasks.remove((run, test_spk))
+            continue
 
         # ── MÓDOSÍTÁS: Egyedi, determinisztikus seed beállítása a feladathoz ──
         spk_idx = dysarthric_spks.index(test_spk)
@@ -627,49 +624,38 @@ def loso_cv(
         model     = DysarthriaClassifier(model_name).to(device)
         optimizer = build_optimizer(model)
 
-        checkpoint = load_checkpoint(ckpt_path, model, optimizer, device)
-        already_done = checkpoint is not None and checkpoint.get('epoch', 0) >= num_epochs
-
         if use_salr:
-            if already_done:
-                print(f"  {test_spk:<8s} | already completed ({checkpoint['epoch']}/{num_epochs} epochs) — skipping training.")
-            else:
-                anchor_sampler = RandomBatchSampler(dataset_size=len(train_samples), batch_size=4)
-                salr_collator  = SALRTripletCollator(train_ds)
-                train_loader   = DataLoader(train_ds, batch_sampler=anchor_sampler, collate_fn=salr_collator)
-                criterion      = SALRLoss()
+            anchor_sampler = RandomBatchSampler(dataset_size=len(train_samples), batch_size=4)
+            salr_collator  = SALRTripletCollator(train_ds)
+            train_loader   = DataLoader(train_ds, batch_sampler=anchor_sampler, collate_fn=salr_collator)
+            criterion      = SALRLoss()
 
-                start_epoch  = checkpoint['epoch'] if checkpoint else 0
-                step         = checkpoint['step'] if checkpoint else 0
-                loss_history = checkpoint['loss_history'] if checkpoint else []
+            step         = 0
+            loss_history = []
 
-                for epoch in range(start_epoch, num_epochs):
-                    epoch_stats, step = train_one_epoch_salr(model, train_loader, optimizer, criterion, device, step)
-                    loss_history.append({"epoch": epoch + 1, **epoch_stats})
+            for epoch in range(num_epochs):
+                epoch_stats, step = train_one_epoch_salr(model, train_loader, optimizer, criterion, device, step)
+                loss_history.append({"epoch": epoch + 1, **epoch_stats})
 
-                    print(f"    epoch {epoch+1:3d}/{num_epochs}  loss={epoch_stats['loss']:.4f}  ce={epoch_stats['loss_ce']:.4f}  triplet={epoch_stats['loss_triplet']:.4f}  alpha={epoch_stats['alpha']:.1f}")
+                print(f"    epoch {epoch+1:3d}/{num_epochs}  loss={epoch_stats['loss']:.4f}  ce={epoch_stats['loss_ce']:.4f}  triplet={epoch_stats['loss_triplet']:.4f}  alpha={epoch_stats['alpha']:.1f}")
 
-                    is_last = (epoch + 1) == num_epochs
-                    if (epoch + 1) % CHECKPOINT_EVERY == 0 or is_last:
-                        save_checkpoint(ckpt_path, model, optimizer, epoch=epoch + 1, num_epochs=num_epochs, step=step, run=run, test_spk=test_spk, use_salr=True, loss_history=loss_history)
+                is_last = (epoch + 1) == num_epochs
+                if (epoch + 1) % CHECKPOINT_EVERY == 0 or is_last:
+                    save_checkpoint(ckpt_path, model, epoch=epoch + 1, num_epochs=num_epochs, step=step, run=run, test_spk=test_spk, use_salr=True, loss_history=loss_history)
         else:
-            if already_done:
-                print(f"  {test_spk:<8s} | already completed ({checkpoint['epoch']}/{num_epochs} epochs) — skipping training.")
-            else:
-                train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-                criterion_base = nn.CrossEntropyLoss()
+            train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+            criterion_base = nn.CrossEntropyLoss()
 
-                start_epoch  = checkpoint['epoch'] if checkpoint else 0
-                loss_history = checkpoint['loss_history'] if checkpoint else []
+            loss_history = []
 
-                for epoch in range(start_epoch, num_epochs):
-                    loss = train_one_epoch_baseline(model, train_loader, optimizer, criterion_base, device)
-                    loss_history.append({"epoch": epoch + 1, "loss": loss})
-                    print(f"    epoch {epoch+1:3d}/{num_epochs}  loss={loss:.4f}")
+            for epoch in range(num_epochs):
+                loss = train_one_epoch_baseline(model, train_loader, optimizer, criterion_base, device)
+                loss_history.append({"epoch": epoch + 1, "loss": loss})
+                print(f"    epoch {epoch+1:3d}/{num_epochs}  loss={loss:.4f}")
 
-                    is_last = (epoch + 1) == num_epochs
-                    if (epoch + 1) % CHECKPOINT_EVERY == 0 or is_last:
-                        save_checkpoint(ckpt_path, model, optimizer, epoch=epoch + 1, num_epochs=num_epochs, step=0, run=run, test_spk=test_spk, use_salr=False, loss_history=loss_history)
+                is_last = (epoch + 1) == num_epochs
+                if (epoch + 1) % CHECKPOINT_EVERY == 0 or is_last:
+                    save_checkpoint(ckpt_path, model, epoch=epoch + 1, num_epochs=num_epochs, step=0, run=run, test_spk=test_spk, use_salr=False, loss_history=loss_history)
 
         metrics = evaluate(model, test_loader, device)
         per_run_acc[run].append(metrics['accuracy'])
@@ -766,6 +752,7 @@ def load_ua_speech(
 
     samples: List[Dict] = []
     dysarthric_spks: List[str] = []
+    n_truncated = 0
 
     for spk_id, spk_meta in meta.items():
         spk_dir = os.path.join(data_root, spk_id)
@@ -811,6 +798,14 @@ def load_ua_speech(
                     wt = T.Resample(sr, SAMPLE_RATE)(wt)
                     waveform = wt.squeeze(0).numpy()
 
+            # Cut clips longer than MAX_CLIP_SECONDS (15.6 s @ 16 kHz =
+            # 249 600 samples) so that padding a batch up to one long
+            # outlier doesn't blow up memory.
+            max_samples = int(MAX_CLIP_SECONDS * SAMPLE_RATE)
+            if waveform.shape[0] > max_samples:
+                waveform = waveform[:max_samples]
+                n_truncated += 1
+
             # Determine common vs uncommon word
             # word_id is bx_uwx for uncommon words
             if word_id.startswith("b"):
@@ -828,6 +823,9 @@ def load_ua_speech(
 
     print(f"Loaded {len(samples)} samples from {len(meta)} speakers "
           f"({len(dysarthric_spks)} dysarthric).")
+    if n_truncated:
+        print(f"  Truncated {n_truncated} clip(s) to {MAX_CLIP_SECONDS:.1f}s "
+              f"({int(MAX_CLIP_SECONDS * SAMPLE_RATE)} samples).")
     return samples, dysarthric_spks
 
 import time
@@ -850,7 +848,6 @@ def checkpoint_path(ckpt_dir: str, run: int, test_spk: str, use_salr: bool) -> s
 def save_checkpoint(
     path:         str,
     model:        nn.Module,
-    optimizer:    torch.optim.Optimizer,
     epoch:        int,
     num_epochs:   int,
     step:         int,
@@ -859,39 +856,22 @@ def save_checkpoint(
     use_salr:     bool,
     loss_history: List[Dict],
 ) -> None:
-    """Persist full training state so this fold can resume on any machine."""
+    """Persist training state for this completed fold (used for the
+    already-exists check and for post-hoc inspection of loss curves)."""
     checkpoint = {
         "model_state_dict":     model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
         "epoch":                epoch,
         "step":                 step,
         "run":                  run,
         "test_spk":             test_spk,
         "use_salr":             use_salr,
         "loss_history":         loss_history,
-        # RNG states so a resumed fold draws the same triplets / batch
-        # orders it would have drawn had it never stopped.
-        "python_random_state":  random.getstate(),
-        "numpy_random_state":   np.random.get_state(),
-        "torch_random_state":   torch.get_rng_state(),
         "timestamp":            time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
-    # Save CUDA RNG state if available (makes resumed training deterministic
-    # for GPU-side randomness). Store as CPU tensors so checkpoints are
-    # portable when loaded on a different device.
-    if torch.cuda.is_available():
-        try:
-            cuda_states = torch.cuda.get_rng_state_all()
-            # move to CPU to make checkpoint loadable on CPU-only hosts
-            checkpoint["cuda_random_states"] = [s.cpu() for s in cuda_states]
-        except Exception:
-            # best-effort; don't fail checkpointing because of cuda state
-            pass
-
     # Write to a temp file then atomically rename, so a crash mid-write
     # (or two machines writing at once) never leaves a half-written file
-    # that a resuming machine would try to load.
+    # that another machine's existence check would pick up.
     tmp_path = path + ".tmp"
     torch.save(checkpoint, tmp_path)
 
@@ -914,46 +894,8 @@ def save_checkpoint(
                 time.sleep(0.5)  # Várunk fél másodpercet, amíg a fájlzár felszabadul
     # --------------------------------------------------
 
-    print(f"    [checkpoint] saved epoch {epoch:3d}/{{num_epochs}} → {path}  "
+    print(f"    [checkpoint] saved epoch {epoch:3d}/{num_epochs} → {path}  "
           f"(loss={loss_history[-1].get('loss', float('nan')):.4f})")
-
-
-def load_checkpoint(
-    path:      str,
-    model:     nn.Module,
-    optimizer: torch.optim.Optimizer,
-    device:    torch.device,
-) -> Optional[Dict]:
-    """Load training state if a checkpoint exists; returns None if this
-    fold hasn't been started yet, so the caller trains from scratch."""
-    if not os.path.exists(path):
-        return None
-
-    # weights_only=False: recent torch versions default to True, which
-    # rejects the RNG-state tuples and loss_history list we saved above
-    # (they aren't tensors). Safe here since these are our own local files,
-    # not checkpoints downloaded from somewhere untrusted.
-    checkpoint = torch.load(path, map_location=device, weights_only=False)
-
-    model.load_state_dict(checkpoint["model_state_dict"])
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    random.setstate(checkpoint["python_random_state"])
-    np.random.set_state(checkpoint["numpy_random_state"])
-    torch.set_rng_state(checkpoint["torch_random_state"].cpu())
-
-    # Restore CUDA RNGs if available and present in the checkpoint.
-    if torch.cuda.is_available() and "cuda_random_states" in checkpoint:
-        try:
-            # checkpoint stores CPU tensors; move them to CUDA device(s).
-            cuda_states = [s.cuda() for s in checkpoint["cuda_random_states"]]
-            torch.cuda.set_rng_state_all(cuda_states)
-        except Exception:
-            pass
-
-    print(f"    [checkpoint] resumed {checkpoint['test_spk']} from epoch "
-          f"{checkpoint['epoch']:3d} (saved {checkpoint['timestamp']}) ← {path}")
-
-    return checkpoint
 
 
 # ------------------------- Claim utilities -------------------------------
