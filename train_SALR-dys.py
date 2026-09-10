@@ -578,11 +578,9 @@ def loso_cv(
     while tasks:
         run, test_spk = random.choice(tasks)
 
-        # quick check: if a checkpoint already exists for this fold — whether
-        # it finished all num_epochs or not — skip it rather than resuming.
-        ckpt_path = checkpoint_path(checkpoint_dir, run, test_spk, use_salr)
-        if os.path.exists(ckpt_path):
-            print(f"  Skip {test_spk} (run {run}): checkpoint already exists — not resuming.")
+        # Check if ANY checkpoint exists for this fold
+        if has_any_checkpoint(checkpoint_dir, run, test_spk, use_salr):
+            print(f"  Skip {test_spk} (run {run}): existing checkpoint found — skipping fold.")
             tasks.remove((run, test_spk))
             continue
 
@@ -590,9 +588,8 @@ def loso_cv(
         if not claimed:
             continue
 
-        # re-check after claiming, in case another worker created this fold's
-        # checkpoint while we were in the process of claiming it.
-        if os.path.exists(ckpt_path):
+        # Re-check after claiming in case another worker saved a checkpoint
+        if has_any_checkpoint(checkpoint_dir, run, test_spk, use_salr):
             release_claim(claim_storage_dir, run, test_spk, use_salr)
             tasks.remove((run, test_spk))
             continue
@@ -641,7 +638,9 @@ def loso_cv(
 
                 is_last = (epoch + 1) == num_epochs
                 if (epoch + 1) % CHECKPOINT_EVERY == 0 or is_last:
-                    save_checkpoint(ckpt_path, model, epoch=epoch + 1, num_epochs=num_epochs, step=step, run=run, test_spk=test_spk, use_salr=True, loss_history=loss_history)
+                    ep_ckpt_path = checkpoint_path(checkpoint_dir, run, test_spk, use_salr, epoch=epoch + 1)
+                    save_checkpoint(ep_ckpt_path, model, epoch=epoch + 1, num_epochs=num_epochs, step=step, run=run,
+                                    test_spk=test_spk, use_salr=True, loss_history=loss_history)
         else:
             train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
             criterion_base = nn.CrossEntropyLoss()
@@ -655,7 +654,9 @@ def loso_cv(
 
                 is_last = (epoch + 1) == num_epochs
                 if (epoch + 1) % CHECKPOINT_EVERY == 0 or is_last:
-                    save_checkpoint(ckpt_path, model, epoch=epoch + 1, num_epochs=num_epochs, step=0, run=run, test_spk=test_spk, use_salr=False, loss_history=loss_history)
+                    ep_ckpt_path = checkpoint_path(checkpoint_dir, run, test_spk, use_salr, epoch=epoch + 1)
+                    save_checkpoint(ep_ckpt_path, model, epoch=epoch + 1, num_epochs=num_epochs, step=0, run=run,
+                                    test_spk=test_spk, use_salr=False, loss_history=loss_history)
 
         metrics = evaluate(model, test_loader, device)
         per_run_acc[run].append(metrics['accuracy'])
@@ -835,14 +836,26 @@ import time
 CHECKPOINT_EVERY = 5   # save every 5 epochs
 
 
-def checkpoint_path(ckpt_dir: str, run: int, test_spk: str, use_salr: bool) -> str:
-    """One file per (run, held-out speaker, model type) — the natural unit
-    of parallel work: each LOSO fold is an independent model, so each
-    machine can safely own a disjoint set of these files with zero
-    coordination beyond "don't pick a fold someone else already claimed"."""
+def checkpoint_path(ckpt_dir: str, run: int, test_spk: str, use_salr: bool, epoch: Optional[int] = None) -> str:
+    """Returns the file path for a given fold checkpoint, optionally tagged by epoch."""
     os.makedirs(ckpt_dir, exist_ok=True)
     tag = "salr" if use_salr else "baseline"
+    if epoch is not None:
+        return os.path.join(ckpt_dir, f"run{run}_{test_spk}_{tag}_ep{epoch}.pt")
     return os.path.join(ckpt_dir, f"run{run}_{test_spk}_{tag}.pt")
+
+
+def has_any_checkpoint(ckpt_dir: str, run: int, test_spk: str, use_salr: bool) -> bool:
+    """Returns True if any checkpoint file exists for this specific fold."""
+    if not os.path.exists(ckpt_dir):
+        return False
+    tag = "salr" if use_salr else "baseline"
+    prefix = f"run{run}_{test_spk}_{tag}"
+
+    for fname in os.listdir(ckpt_dir):
+        if fname.startswith(prefix) and fname.endswith(".pt"):
+            return True
+    return False
 
 
 def save_checkpoint(
