@@ -394,56 +394,138 @@ def build_optimizer(model: nn.Module) -> torch.optim.Optimizer:
 
 
 def train_one_epoch_salr(
-    model:     DysarthriaClassifier,
-    loader:    DataLoader,
-    optimizer: torch.optim.Optimizer,
-    criterion: SALRLoss,
-    device:    torch.device,
-    step:      int,
+        model: DysarthriaClassifier,
+        loader: DataLoader,
+        optimizer: torch.optim.Optimizer,
+        criterion: SALRLoss,
+        device: torch.device,
+        step: int,
 ) -> Tuple[Dict[str, float], int]:
-    """SALR multi-task training epoch. Returns (epoch_stats, updated_step),
-    where epoch_stats has mean total/CE/triplet loss and the alpha value
-    active at the end of the epoch."""
+    """SALR multi-task training epoch with detailed batch and embedding debug prints."""
     model.train()
     totals = defaultdict(float)
     n_batches = 0
 
-    for batch in loader:
-        iv   = batch["input_values"].to(device)
+    # --- OSZTÁLYCÍMKÉK ÉS MODELLFEJ ELLENŐRZÉSE ---
+    print("\n" + "=" * 50)
+    print("[DEBUG] OSZTÁLYCÍMKÉK ÉS CSATLAKOZÁS ELLENŐRZÉSE")
+    print("=" * 50)
+
+    # 1. Modell kimeneti dimenziójának lekérése
+    # --- MODELL KIMENETI MÉRETÉNEK LEKÉRDEZÉSE (HIBAJAVÍTOTT) ---
+    num_classes_model = None
+
+    # 1. Ha van közvetlen out_features (sima nn.Linear)
+    if hasattr(model.classifier, 'out_features'):
+        num_classes_model = model.classifier.out_features
+
+    # 2. Ha Sequential modul (pl. Dropout + Linear)
+    elif isinstance(model.classifier, torch.nn.Sequential):
+        for layer in reversed(model.classifier):
+            if hasattr(layer, 'out_features'):
+                num_classes_model = layer.out_features
+                break
+
+    # 3. Ha egyedi ClassificationHead objektum (keressük a benne lévő utolsó Linear réteget)
+    elif hasattr(model.classifier, 'out_proj') and hasattr(model.classifier.out_proj, 'out_features'):
+        num_classes_model = model.classifier.out_proj.out_features
+    elif hasattr(model.classifier, 'dense') and hasattr(model.classifier.dense, 'out_features'):
+        num_classes_model = model.classifier.dense.out_features
+    else:
+        # Általános keresés: az utolsó nn.Linear réteg out_features attribútumát keressük a classifier-ben
+        for module in model.classifier.modules():
+            if isinstance(module, torch.nn.Linear):
+                num_classes_model = module.out_features
+
+    print(f"-> Modell osztályozó fej kimeneti mérete: {num_classes_model}")
+
+    # 2. Egy batch lekérése az adatbetöltőből
+    sample_batch = next(iter(loader))
+    sample_sev = sample_batch["severity"]
+
+    print(f"-> Címkék Tensor Típusa (Dtype): {sample_sev.dtype}")
+    print(f"-> Címkék Shape-je a batchben:     {list(sample_sev.shape)}")
+    print(f"-> Batch-ben lévő nyers értékek:    {sample_sev.tolist()}")
+    print(f"-> Egyedi értékek a batch-ben:     {torch.unique(sample_sev).tolist()}")
+
+    # 3. Validációk (Hibát dobnak, ha valami nem stimmel)
+    assert sample_sev.dtype == torch.long, f"HIBA: A címkék típusa {sample_sev.dtype}, de torch.long-nak kellene lennie!"
+
+    max_label = sample_sev.max().item()
+    min_label = sample_sev.min().item()
+
+    assert min_label >= 0, f"HIBA: Negatív osztálycímke található: {min_label}"
+    assert max_label < num_classes_model, (
+        f"HIBA: A címkék között szerepel a(z) {max_label} érték, "
+        f"de a modell fej csak {num_classes_model} osztályra van méretezve (max index: {num_classes_model - 1})!"
+    )
+
+    print("=" * 50 + "\n")
+
+
+    print(f"\n    [DEBUG Training] Beginning Epoch — Initial Step: {step}")
+
+    for batch_idx, batch in enumerate(loader):
+        iv = batch["input_values"].to(device)
         mask = batch["attention_mask"].to(device)
-        sev  = batch["severity"].to(device)
+        sev = batch["severity"].to(device)
         optimizer.zero_grad()
 
-        with autocast(device_type=device.type, dtype=torch.bfloat16):
-            logits, emb = model(iv, mask)
+        # Execute forward pass
+        logits, emb = model(iv, mask)
 
-            anchor_logits     = logits[0::3]
-            anchor_severities = sev[0::3]
-            anchor_emb        = emb[0::3]
-            negative_emb      = emb[1::3]
-            positive_emb      = emb[2::3]
+        anchor_logits = logits[0::3]
+        anchor_severities = sev[0::3]
+        anchor_emb = emb[0::3]
+        negative_emb = emb[1::3]
+        positive_emb = emb[2::3]
 
-            loss, info = criterion(
-                anchor_logits, anchor_severities,
-                anchor_emb, positive_emb, negative_emb,
-                step,
-            )
+        loss, info = criterion(
+            anchor_logits, anchor_severities,
+            anchor_emb, positive_emb, negative_emb,
+            step,
+        )
 
+        # Backward pass
         loss.backward()
+
+        # Calculate gradient norm to check if weights are updating properly
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf")).item()
+
         optimizer.step()
 
-        totals["loss"]         += info["loss"]
-        totals["loss_ce"]      += info["loss_ce"]
+        totals["loss"] += info["loss"]
+        totals["loss_ce"] += info["loss_ce"]
         totals["loss_triplet"] += info["loss_triplet"]
-        totals["alpha"] = info["alpha"]   # last value, not summed
+        totals["alpha"] = info["alpha"]
         n_batches += 1
         step += 1
 
+        # Detailed step printout for every batch
+        with torch.no_grad():
+            emb_mean = anchor_emb.mean().item()
+            emb_std = anchor_emb.std().item()
+            emb_min = anchor_emb.min().item()
+            emb_max = anchor_emb.max().item()
+
+            # Print first 5 values of the very first anchor embedding in the batch
+            sample_vector = anchor_emb[0, :5].cpu().tolist()
+            formatted_sample = ", ".join(f"{v:.4f}" for v in sample_vector)
+
+        print(
+            f"      [Batch {batch_idx + 1:03d}/{len(loader):03d} | Step {step:05d}] "
+            f"Loss: {info['loss']:.4f} (CE: {info['loss_ce']:.4f}, Triplet: {info['loss_triplet']:.4f}) | "
+            f"Alpha: {info['alpha']:.1f} | GradNorm: {grad_norm:.4f}\n"
+            f"        └─ Embeddings Shape: {list(anchor_emb.shape)} | "
+            f"Stats -> Mean: {emb_mean:.4f}, Std: {emb_std:.4f}, Min: {emb_min:.4f}, Max: {emb_max:.4f}\n"
+            f"        └─ Anchor[0][:5] Sample Vector: [{formatted_sample}]"
+        )
+
     epoch_stats = {
-        "loss":         totals["loss"] / max(n_batches, 1),
-        "loss_ce":      totals["loss_ce"] / max(n_batches, 1),
+        "loss": totals["loss"] / max(n_batches, 1),
+        "loss_ce": totals["loss_ce"] / max(n_batches, 1),
         "loss_triplet": totals["loss_triplet"] / max(n_batches, 1),
-        "alpha":        totals["alpha"],
+        "alpha": totals["alpha"],
     }
     return epoch_stats, step
 
@@ -634,7 +716,8 @@ def loso_cv(
                 epoch_stats, step = train_one_epoch_salr(model, train_loader, optimizer, criterion, device, step)
                 loss_history.append({"epoch": epoch + 1, **epoch_stats})
 
-                print(f"    epoch {epoch+1:3d}/{num_epochs}  loss={epoch_stats['loss']:.4f}  ce={epoch_stats['loss_ce']:.4f}  triplet={epoch_stats['loss_triplet']:.4f}  alpha={epoch_stats['alpha']:.1f}")
+                val_metrics = evaluate(model, test_loader, device)
+                print(f"    epoch {epoch + 1:3d}/{num_epochs}  loss={epoch_stats['loss']:.4f}  ce={epoch_stats['loss_ce']:.4f}  triplet={epoch_stats['loss_triplet']:.4f}  alpha={epoch_stats['alpha']:.1f} | Val Acc: {val_metrics['accuracy']:5.1f}%  F1: {val_metrics['f1']:5.1f}%")
 
                 is_last = (epoch + 1) == num_epochs
                 if (epoch + 1) % CHECKPOINT_EVERY == 0 or is_last:
@@ -721,27 +804,11 @@ def load_ua_speech(
     metadata_path: str,
 ) -> Tuple[List[Dict], List[str]]:
     """
-    Load UA-Speech into a flat list of sample dicts.
-
-    Parameters
-    ----------
-    data_root     : directory containing one sub-folder per speaker
-                    (e.g. data_root/M01/word_id.wav)
-    metadata_path : CSV with columns:
-                    speaker_id, intelligibility, is_dysarthric
-
-    Returns
-    -------
-    samples           : list of sample dicts
-    dysarthric_spks   : list of speaker IDs with dysarthria
-
-    Notes
-    -----
-    UA-Speech has 15 dysarthric speakers (M01–M12, F01–F04 approx.) and
-    13 healthy controls.  Only dysarthric speakers are used in LOSO-CV.
+    Load UA-Speech into a flat list of sample dicts with added debug output.
     """
     import soundfile as sf
 
+    print(f"\n[DEBUG Data Loading] Reading metadata from: {metadata_path}")
     meta: Dict[str, Dict] = {}
     with open(metadata_path, newline="") as fh:
         for row in csv.DictReader(fh):
@@ -751,14 +818,18 @@ def load_ua_speech(
                 "is_dysarthric":   row["is_dysarthric"].strip().lower() == "true",
             }
 
+    print(f"[DEBUG Data Loading] Found {len(meta)} total speakers in CSV metadata.")
+
     samples: List[Dict] = []
     dysarthric_spks: List[str] = []
     n_truncated = 0
+    missing_dirs = 0
 
     for spk_id, spk_meta in meta.items():
         spk_dir = os.path.join(data_root, spk_id)
         if not os.path.isdir(spk_dir):
-            #print(f"  Warning: directory not found for speaker {spk_id}")
+            missing_dirs += 1
+            print(f"  [DEBUG Warning] Directory missing for speaker: {spk_id} ({spk_dir})")
             continue
 
         if spk_meta["is_dysarthric"]:
@@ -767,21 +838,23 @@ def load_ua_speech(
         severity_str = intelligibility_to_severity(spk_meta["intelligibility"])
         severity_int = SEVERITY_TO_INT[severity_str]
 
-        for fname in sorted(os.listdir(spk_dir)):
-            if not fname.lower().endswith(".wav"):
-                continue
+        wav_files = [f for f in sorted(os.listdir(spk_dir)) if f.lower().endswith(".wav")]
+        print(f"  [DEBUG Loading Speaker] {spk_id:<5s} | Dysarthric: {str(spk_meta['is_dysarthric']):<5s} | Severity: {severity_str:<8s} | Wav files found: {len(wav_files)}")
 
+        spk_sample_count = 0
+        for fname in wav_files:
             word_id = os.path.splitext(fname)[0].lower()
-            if word_id.split("_")[2].startswith('u'):
-                word_id = word_id.split("_")[1] +"_"+ word_id.split("_")[2]
-            else:
-                word_id = word_id.split("_")[2]
+            parts = word_id.split("_")
+            if len(parts) > 2 and parts[2].startswith('u'):
+                word_id = parts[1] + "_" + parts[2]
+            elif len(parts) > 2:
+                word_id = parts[2]
             wav_path = os.path.join(spk_dir, fname)
 
             try:
                 waveform, sr = sf.read(wav_path, dtype="float32")
             except Exception as e:
-                print(f"  Warning: could not read {wav_path}: {e}")
+                print(f"  [DEBUG Error] Could not read file {wav_path}: {e}")
                 continue
 
             # Mono
@@ -799,20 +872,14 @@ def load_ua_speech(
                     wt = T.Resample(sr, SAMPLE_RATE)(wt)
                     waveform = wt.squeeze(0).numpy()
 
-            # Cut clips longer than MAX_CLIP_SECONDS (15.6 s @ 16 kHz =
-            # 249 600 samples) so that padding a batch up to one long
-            # outlier doesn't blow up memory.
+            # Cut clips longer than MAX_CLIP_SECONDS
             max_samples = int(MAX_CLIP_SECONDS * SAMPLE_RATE)
             if waveform.shape[0] > max_samples:
                 waveform = waveform[:max_samples]
                 n_truncated += 1
 
             # Determine common vs uncommon word
-            # word_id is bx_uwx for uncommon words
-            if word_id.startswith("b"):
-                is_common = False
-            else:
-                is_common = True
+            is_common = not word_id.startswith("b")
 
             samples.append({
                 "waveform":   waveform,
@@ -821,12 +888,22 @@ def load_ua_speech(
                 "word_id":    word_id,
                 "is_common":  is_common,
             })
+            spk_sample_count += 1
 
-    print(f"Loaded {len(samples)} samples from {len(meta)} speakers "
-          f"({len(dysarthric_spks)} dysarthric).")
-    if n_truncated:
-        print(f"  Truncated {n_truncated} clip(s) to {MAX_CLIP_SECONDS:.1f}s "
-              f"({int(MAX_CLIP_SECONDS * SAMPLE_RATE)} samples).")
+    common_count = sum(1 for s in samples if s["is_common"])
+    uncommon_count = len(samples) - common_count
+
+    print(f"\n[DEBUG Data Loading Summary]")
+    print(f"  Total samples loaded  : {len(samples)}")
+    print(f"  Common word samples   : {common_count}")
+    print(f"  Uncommon word samples : {uncommon_count}")
+    print(f"  Dysarthric speakers   : {len(dysarthric_spks)} ({', '.join(dysarthric_spks)})")
+    if missing_dirs > 0:
+        print(f"  Missing directories   : {missing_dirs}")
+    if n_truncated > 0:
+        print(f"  Truncated clips (> {MAX_CLIP_SECONDS}s): {n_truncated}")
+    print("-" * 55 + "\n")
+
     return samples, dysarthric_spks
 
 import time
@@ -925,7 +1002,15 @@ def claim_fold(ckpt_dir: str, run: int, test_spk: str, use_salr: bool, ttl: int 
     If a claim exists but is older than `ttl` seconds it will be removed and
     replaced (reclaimed).
     """
-    claim_path = _claim_dir_path(ckpt_dir, run, test_spk, use_salr)
+
+    # Automatikusan létrehozzuk a mappát, ha még nem létezik
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    claim_path = os.path.join(ckpt_dir, f"{run}_{test_spk}_{'salr' if use_salr else 'nosalr'}.claim")
+
+    # ... az eredeti os.open kód folytatódik innen:
+    # fd = os.open(claim_path, flags)
+
     # Use atomic file creation (O_CREAT|O_EXCL) for a reliable claim.
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
     try:
