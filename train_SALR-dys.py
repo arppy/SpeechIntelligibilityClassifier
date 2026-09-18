@@ -37,7 +37,6 @@ from sklearn.linear_model import LogisticRegression
 
 from collections import defaultdict
 from torch.utils.data import BatchSampler
-from torch.amp import autocast
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants  (all directly from the paper)
@@ -245,8 +244,7 @@ class DysarthriaClassifier(nn.Module):
         num_classes: int = NUM_CLASSES,
     ):
         super().__init__()
-        self.wav2vec2   = Wav2Vec2Model.from_pretrained(model_name, gradient_checkpointing=False)
-        self.wav2vec2.gradient_checkpointing_enable()
+        self.wav2vec2   = Wav2Vec2Model.from_pretrained(model_name)
         hidden_size     = self.wav2vec2.config.hidden_size          # 768
         self.classifier = ClassificationHead(hidden_size, num_classes)
 
