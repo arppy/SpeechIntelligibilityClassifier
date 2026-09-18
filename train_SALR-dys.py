@@ -367,13 +367,15 @@ class SALRLoss(nn.Module):
         if alpha > 0.0:
             l_ce = self.ce_loss(anchor_logits, anchor_severities)
             loss = alpha * l_ce + self.lam * l_triplet
+            l_ce_val = l_ce.item()
         else:
             # Avoid CE forward pass entirely when alpha is zero
             loss = self.lam * l_triplet
+            l_ce_val = 0.0
 
         return loss, {
             "loss":         loss.item(),
-            "loss_ce":      l_ce.item(),
+            "loss_ce":      l_ce_val,
             "loss_triplet": l_triplet.item(),
             "alpha":        alpha,
         }
