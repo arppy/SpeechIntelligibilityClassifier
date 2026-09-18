@@ -361,10 +361,15 @@ class SALRLoss(nn.Module):
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         alpha = self._alpha(step)
 
-        l_ce      = self.ce_loss(anchor_logits, anchor_severities)
         l_triplet = self.triplet_loss(anchor_emb, positive_emb, negative_emb)
 
-        loss = alpha * l_ce + self.lam * l_triplet
+        # Conditionally compute Cross-Entropy loss
+        if alpha > 0.0:
+            l_ce = self.ce_loss(anchor_logits, anchor_severities)
+            loss = alpha * l_ce + self.lam * l_triplet
+        else:
+            # Avoid CE forward pass entirely when alpha is zero
+            loss = self.lam * l_triplet
 
         return loss, {
             "loss":         loss.item(),
