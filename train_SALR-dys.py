@@ -343,8 +343,8 @@ class SALRLoss(nn.Module):
         super().__init__()
         self.lam          = lam
         self.warmup_steps = warmup_steps
-        self.ce           = nn.CrossEntropyLoss()
-        self.triplet      = nn.TripletMarginLoss(margin=margin, p=2)
+        self.ce_loss           = nn.CrossEntropyLoss()
+        self.triplet_loss      = nn.TripletMarginLoss(margin=margin, p=2)
 
     def _alpha(self, step: int) -> float:
         """α schedule: 0 during warm-up, 1 afterwards."""
@@ -361,8 +361,8 @@ class SALRLoss(nn.Module):
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         alpha = self._alpha(step)
 
-        l_ce      = self.ce(anchor_logits, anchor_severities)
-        l_triplet = self.triplet(anchor_emb, positive_emb, negative_emb)
+        l_ce      = self.ce_loss(anchor_logits, anchor_severities)
+        l_triplet = self.triplet_loss(anchor_emb, positive_emb, negative_emb)
 
         loss = alpha * l_ce + self.lam * l_triplet
 
@@ -474,9 +474,9 @@ def train_one_epoch_salr(
 
         anchor_logits = logits[0::3]
         anchor_severities = sev[0::3]
-        anchor_emb = emb[0::3]
-        negative_emb = emb[1::3]
-        positive_emb = emb[2::3]
+        anchor_emb = F.normalize(emb[0::3], p=2, dim=-1)
+        negative_emb = F.normalize(emb[1::3], p=2, dim=-1)
+        positive_emb = F.normalize(emb[2::3], p=2, dim=-1)
 
         loss, info = criterion(
             anchor_logits, anchor_severities,
