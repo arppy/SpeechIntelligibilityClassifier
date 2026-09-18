@@ -398,6 +398,21 @@ def build_optimizer(model: nn.Module) -> torch.optim.Optimizer:
     )
 
 
+def check_trainable_parameters(model: torch.nn.Module):
+    trainable_params = 0
+    all_param = 0
+    for name, param in model.named_parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+
+    print(
+        f"Trainable params: {trainable_params:,} | "
+        f"All params: {all_param:,} | "
+        f"Trainable%: {100 * trainable_params / all_param:.2f}%"
+    )
+
+
 def train_one_epoch_salr(
         model: DysarthriaClassifier,
         loader: DataLoader,
@@ -408,6 +423,7 @@ def train_one_epoch_salr(
 ) -> Tuple[Dict[str, float], int]:
     """SALR multi-task training epoch with detailed batch and embedding debug prints."""
     model.train()
+    check_trainable_parameters(model)
     totals = defaultdict(float)
     n_batches = 0
 
