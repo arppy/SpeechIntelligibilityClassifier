@@ -50,7 +50,7 @@ MAX_CLIP_SECONDS    = 15.6    # clips longer than this are truncated on load,
 
 # § 2.2 – fine-tuning hyper-parameters
 BATCH_SIZE         = 3
-LEARNING_RATE      = 5e-4     # 0.0005
+LEARNING_RATE      = 1e-4     # 0.0005
 ADAM_BETAS         = (0.9, 0.98)
 ADAM_EPSILON       = 1e-8
 
@@ -569,9 +569,6 @@ def train_one_epoch_baseline(
 
         logits, _ = model(iv, mask)
         loss      = criterion(logits, sev)
-        print("Logits shape:", logits.shape)
-        print("Preds (first 5):", torch.argmax(logits, dim=-1))
-        print("Targets (first 5):", sev)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
