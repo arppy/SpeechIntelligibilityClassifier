@@ -569,7 +569,9 @@ def train_one_epoch_baseline(
 
         logits, _ = model(iv, mask)
         loss      = criterion(logits, sev)
-
+        print("Logits shape:", logits.shape)
+        print("Preds (first 5):", torch.argmax(logits, dim=-1))
+        print("Targets (first 5):", sev)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -754,7 +756,9 @@ def loso_cv(
             for epoch in range(num_epochs):
                 loss = train_one_epoch_baseline(model, train_loader, optimizer, criterion_base, device)
                 loss_history.append({"epoch": epoch + 1, "loss": loss})
-                print(f"    epoch {epoch+1:3d}/{num_epochs}  loss={loss:.4f}")
+
+                val_metrics = evaluate(model, test_loader, device)
+                print(f"    epoch {epoch + 1:3d}/{num_epochs}  | Val Acc: {val_metrics['accuracy']:5.1f}%  F1: {val_metrics['f1']:5.1f}%")
 
                 is_last = (epoch + 1) == num_epochs
                 if (epoch + 1) % CHECKPOINT_EVERY == 0 or is_last:
