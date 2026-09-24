@@ -402,6 +402,7 @@ def check_trainable_parameters(model: torch.nn.Module):
     trainable_params = 0
     all_param = 0
     for name, param in model.named_parameters():
+        print(name, param.requires_grad)
         all_param += param.numel()
         if param.requires_grad:
             trainable_params += param.numel()
