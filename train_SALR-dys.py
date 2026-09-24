@@ -413,76 +413,21 @@ def check_trainable_parameters(model: torch.nn.Module):
     )
 
 
-def train_one_epoch_salr(
+def train_one_epoch(
         model: DysarthriaClassifier,
         loader: DataLoader,
         optimizer: torch.optim.Optimizer,
-        criterion: SALRLoss,
+        criterion: nn.Module,
         device: torch.device,
-        step: int,
+        mode: str = "salr",
+        step: int = 0,
 ) -> Tuple[Dict[str, float], int]:
-    """SALR multi-task training epoch with detailed batch and embedding debug prints."""
+    """
+    Egységes tanítási epoch részletes batch-szintű debug logolással.
+    """
     model.train()
-    check_trainable_parameters(model)
     totals = defaultdict(float)
     n_batches = 0
-
-    # --- OSZTÁLYCÍMKÉK ÉS MODELLFEJ ELLENŐRZÉSE ---
-    print("\n" + "=" * 50)
-    print("[DEBUG] OSZTÁLYCÍMKÉK ÉS CSATLAKOZÁS ELLENŐRZÉSE")
-    print("=" * 50)
-
-    # 1. Modell kimeneti dimenziójának lekérése
-    # --- MODELL KIMENETI MÉRETÉNEK LEKÉRDEZÉSE (HIBAJAVÍTOTT) ---
-    num_classes_model = None
-
-    # 1. Ha van közvetlen out_features (sima nn.Linear)
-    if hasattr(model.classifier, 'out_features'):
-        num_classes_model = model.classifier.out_features
-
-    # 2. Ha Sequential modul (pl. Dropout + Linear)
-    elif isinstance(model.classifier, torch.nn.Sequential):
-        for layer in reversed(model.classifier):
-            if hasattr(layer, 'out_features'):
-                num_classes_model = layer.out_features
-                break
-
-    # 3. Ha egyedi ClassificationHead objektum (keressük a benne lévő utolsó Linear réteget)
-    elif hasattr(model.classifier, 'out_proj') and hasattr(model.classifier.out_proj, 'out_features'):
-        num_classes_model = model.classifier.out_proj.out_features
-    elif hasattr(model.classifier, 'dense') and hasattr(model.classifier.dense, 'out_features'):
-        num_classes_model = model.classifier.dense.out_features
-    else:
-        # Általános keresés: az utolsó nn.Linear réteg out_features attribútumát keressük a classifier-ben
-        for module in model.classifier.modules():
-            if isinstance(module, torch.nn.Linear):
-                num_classes_model = module.out_features
-
-    print(f"-> Modell osztályozó fej kimeneti mérete: {num_classes_model}")
-
-    # 2. Egy batch lekérése az adatbetöltőből
-    sample_batch = next(iter(loader))
-    sample_sev = sample_batch["severity"]
-
-    print(f"-> Címkék Tensor Típusa (Dtype): {sample_sev.dtype}")
-    print(f"-> Címkék Shape-je a batchben:     {list(sample_sev.shape)}")
-    print(f"-> Batch-ben lévő nyers értékek:    {sample_sev.tolist()}")
-    print(f"-> Egyedi értékek a batch-ben:     {torch.unique(sample_sev).tolist()}")
-
-    # 3. Validációk (Hibát dobnak, ha valami nem stimmel)
-    assert sample_sev.dtype == torch.long, f"HIBA: A címkék típusa {sample_sev.dtype}, de torch.long-nak kellene lennie!"
-
-    max_label = sample_sev.max().item()
-    min_label = sample_sev.min().item()
-
-    assert min_label >= 0, f"HIBA: Negatív osztálycímke található: {min_label}"
-    assert max_label < num_classes_model, (
-        f"HIBA: A címkék között szerepel a(z) {max_label} érték, "
-        f"de a modell fej csak {num_classes_model} osztályra van méretezve (max index: {num_classes_model - 1})!"
-    )
-
-    print("=" * 50 + "\n")
-
 
     print(f"\n    [DEBUG Training] Beginning Epoch — Initial Step: {step}")
 
@@ -492,89 +437,208 @@ def train_one_epoch_salr(
         sev = batch["severity"].to(device)
         optimizer.zero_grad()
 
-        # Execute forward pass
+        # Forward pass
         logits, emb = model(iv, mask)
 
-        anchor_logits = logits[0::3]
-        anchor_severities = sev[0::3]
-        anchor_emb = F.normalize(emb[0::3], p=2, dim=-1)
-        negative_emb = F.normalize(emb[1::3], p=2, dim=-1)
-        positive_emb = F.normalize(emb[2::3], p=2, dim=-1)
+        if mode == "salr":
+            anchor_logits = logits[0::3]
+            anchor_severities = sev[0::3]
+            anchor_emb = F.normalize(emb[0::3], p=2, dim=-1)
+            negative_emb = F.normalize(emb[1::3], p=2, dim=-1)
+            positive_emb = F.normalize(emb[2::3], p=2, dim=-1)
 
-        loss, info = criterion(
-            anchor_logits, anchor_severities,
-            anchor_emb, positive_emb, negative_emb,
-            step,
-        )
+            loss, info = criterion(
+                anchor_logits, anchor_severities,
+                anchor_emb, positive_emb, negative_emb,
+                step,
+            )
 
-        # Backward pass
-        loss.backward()
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf")).item()
+            optimizer.step()
 
-        # Calculate gradient norm to check if weights are updating properly
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf")).item()
+            totals["loss"] += info["loss"]
+            totals["loss_ce"] += info["loss_ce"]
+            totals["loss_triplet"] += info["loss_triplet"]
+            totals["alpha"] = info["alpha"]
 
-        optimizer.step()
+            # ── VISSZARAKOTT RÉSZLETES DEBUG PRINT (SALR) ──
+            with torch.no_grad():
+                emb_mean = anchor_emb.mean().item()
+                emb_std = anchor_emb.std().item()
+                emb_min = anchor_emb.min().item()
+                emb_max = anchor_emb.max().item()
 
-        totals["loss"] += info["loss"]
-        totals["loss_ce"] += info["loss_ce"]
-        totals["loss_triplet"] += info["loss_triplet"]
-        totals["alpha"] = info["alpha"]
+                sample_vector = anchor_emb[0, :5].cpu().tolist()
+                formatted_sample = ", ".join(f"{v:.4f}" for v in sample_vector)
+
+            print(
+                f"      [Batch {batch_idx + 1:03d}/{len(loader):03d} | Step {step:05d}] "
+                f"Loss: {info['loss']:.4f} (CE: {info['loss_ce']:.4f}, Triplet: {info['loss_triplet']:.4f}) | "
+                f"Alpha: {info['alpha']:.1f} | GradNorm: {grad_norm:.4f}\n"
+                f"        └─ Embeddings Shape: {list(anchor_emb.shape)} | "
+                f"Stats -> Mean: {emb_mean:.4f}, Std: {emb_std:.4f}, Min: {emb_min:.4f}, Max: {emb_max:.4f}\n"
+                f"        └─ Anchor[0][:5] Sample Vector: [{formatted_sample}]"
+            )
+            step += 1
+
+        else:
+            # Baseline & Full módok esetén (Sima Cross-Entropy)
+            loss = criterion(logits, sev)
+
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf")).item()
+            optimizer.step()
+
+            totals["loss"] += loss.item()
+
+            # ── DEBUG PRINT (BASELINE / FULL MÓD) ──
+            with torch.no_grad():
+                emb_norm = F.normalize(emb, p=2, dim=-1)
+                emb_mean = emb_norm.mean().item()
+                emb_std = emb_norm.std().item()
+                sample_vector = emb_norm[0, :5].cpu().tolist()
+                formatted_sample = ", ".join(f"{v:.4f}" for v in sample_vector)
+
+            print(
+                f"      [Batch {batch_idx + 1:03d}/{len(loader):03d} | Step {step:05d}] "
+                f"Loss (CE): {loss.item():.4f} | GradNorm: {grad_norm:.4f}\n"
+                f"        └─ Embeddings Shape: {list(emb.shape)} | "
+                f"Stats -> Mean: {emb_mean:.4f}, Std: {emb_std:.4f}\n"
+                f"        └─ Sample Vector[0][:5]: [{formatted_sample}]"
+            )
+            step += 1
+
         n_batches += 1
-        step += 1
 
-        # Detailed step printout for every batch
-        with torch.no_grad():
-            emb_mean = anchor_emb.mean().item()
-            emb_std = anchor_emb.std().item()
-            emb_min = anchor_emb.min().item()
-            emb_max = anchor_emb.max().item()
+    epoch_stats = {k: v / max(n_batches, 1) for k, v in totals.items() if k != "alpha"}
+    if mode == "salr":
+        epoch_stats["alpha"] = totals["alpha"]
 
-            # Print first 5 values of the very first anchor embedding in the batch
-            sample_vector = anchor_emb[0, :5].cpu().tolist()
-            formatted_sample = ", ".join(f"{v:.4f}" for v in sample_vector)
-
-        print(
-            f"      [Batch {batch_idx + 1:03d}/{len(loader):03d} | Step {step:05d}] "
-            f"Loss: {info['loss']:.4f} (CE: {info['loss_ce']:.4f}, Triplet: {info['loss_triplet']:.4f}) | "
-            f"Alpha: {info['alpha']:.1f} | GradNorm: {grad_norm:.4f}\n"
-            f"        └─ Embeddings Shape: {list(anchor_emb.shape)} | "
-            f"Stats -> Mean: {emb_mean:.4f}, Std: {emb_std:.4f}, Min: {emb_min:.4f}, Max: {emb_max:.4f}\n"
-            f"        └─ Anchor[0][:5] Sample Vector: [{formatted_sample}]"
-        )
-
-    epoch_stats = {
-        "loss": totals["loss"] / max(n_batches, 1),
-        "loss_ce": totals["loss_ce"] / max(n_batches, 1),
-        "loss_triplet": totals["loss_triplet"] / max(n_batches, 1),
-        "alpha": totals["alpha"],
-    }
     return epoch_stats, step
 
 
-def train_one_epoch_baseline(
-    model:     DysarthriaClassifier,
-    loader:    DataLoader,
-    optimizer: torch.optim.Optimizer,
-    criterion: nn.CrossEntropyLoss,
-    device:    torch.device,
-) -> float:
-    """Cross-entropy-only training epoch for the fine-tuned baseline."""
-    model.train()
-    total = 0.0
+def run_training_pipeline(
+        model: DysarthriaClassifier,
+        train_loader: DataLoader,
+        optimizer: torch.optim.Optimizer,
+        criterion: nn.Module,
+        device: torch.device,
+        num_epochs: int,
+        mode: str,
+        test_loader: Optional[DataLoader] = None,
+        checkpoint_dir: str = "./checkpoints",
+        checkpoint_kwargs: Optional[Dict] = None,
+) -> List[Dict]:
+    """
+    Közös tanítási ciklus checkpoint-kezeléssel és validációval.
+    """
+    step = 0
+    loss_history = []
+    checkpoint_kwargs = checkpoint_kwargs or {}
 
-    for batch in loader:
-        iv   = batch["input_values"].to(device)
-        mask = batch["attention_mask"].to(device)
-        sev  = batch["severity"].to(device)
+    for epoch in range(num_epochs):
+        epoch_stats, step = train_one_epoch(
+            model, train_loader, optimizer, criterion, device, mode=mode, step=step
+        )
+        loss_history.append({"epoch": epoch + 1, **epoch_stats})
 
-        logits, _ = model(iv, mask)
-        loss      = criterion(logits, sev)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        total += loss.item()
+        # Opcionális validáció
+        val_str = ""
+        if test_loader is not None:
+            val_metrics = evaluate(model, test_loader, device)
+            val_str = f" | Val Acc: {val_metrics['accuracy']:5.1f}%  F1: {val_metrics['f1']:5.1f}%"
 
-    return total / max(len(loader), 1)
+        # Dinamikus print: SALR esetén kiírja a CE/Triplet/Alpha értékeket is, baseline esetén csak a loss-t
+        if mode == "salr":
+            ce_val = epoch_stats.get('loss_ce', 0.0)
+            triplet_val = epoch_stats.get('loss_triplet', 0.0)
+            alpha_val = epoch_stats.get('alpha', 0.0)
+            print(
+                f"    epoch {epoch + 1:3d}/{num_epochs}  loss={epoch_stats['loss']:.4f}  ce={ce_val:.4f}  triplet={triplet_val:.4f}  alpha={alpha_val:.1f}{val_str}")
+        else:
+            print(f"    epoch {epoch + 1:3d}/{num_epochs}  loss={epoch_stats['loss']:.4f}{val_str}")
+
+        # Checkpointing logika
+        is_last = (epoch + 1) == num_epochs
+        if (epoch + 1) % CHECKPOINT_EVERY == 0 or is_last:
+            ep_ckpt_path = checkpoint_path(
+                checkpoint_dir,
+                run=checkpoint_kwargs.get("run", 0),
+                test_spk=checkpoint_kwargs.get("test_spk", "all"),
+                use_salr=(mode == "salr"),
+                epoch=epoch + 1
+            )
+            save_checkpoint(
+                ep_ckpt_path, model, epoch=epoch + 1, num_epochs=num_epochs, step=step,
+                run=checkpoint_kwargs.get("run", 0), test_spk=checkpoint_kwargs.get("test_spk", "all"),
+                use_salr=(mode == "salr"), loss_history=loss_history
+            )
+
+    return loss_history
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 5. Adatbetöltő Segédfüggvény és Módok (LOSO vs Full Dataset)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def create_dataloaders(
+        train_samples: List[Dict],
+        processor: Wav2Vec2Processor,
+        mode: str,
+        test_samples: Optional[List[Dict]] = None,
+) -> Tuple[DataLoader, Optional[DataLoader], Optional[nn.Module]]:
+    """Adatbetöltők és veszteségfüggvények összeállítása a kiválasztott mód alapján."""
+    train_ds = UASpeechDataset(train_samples, processor)
+
+    if mode == "salr":
+        anchor_sampler = RandomBatchSampler(dataset_size=len(train_samples), batch_size=4)
+        salr_collator = SALRTripletCollator(train_ds)
+        train_loader = DataLoader(train_ds, batch_sampler=anchor_sampler, collate_fn=salr_collator)
+        criterion = SALRLoss()
+    else:
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+        criterion = nn.CrossEntropyLoss()
+
+    test_loader = None
+    if test_samples:
+        test_ds = UASpeechDataset(test_samples, processor)
+        test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+
+    return train_loader, test_loader, criterion
+
+
+def train_full_dataset(
+        all_samples: List[Dict],
+        processor: Wav2Vec2Processor,
+        device: torch.device,
+        model_name: str = "facebook/wav2vec2-base",
+        num_epochs: int = 30,
+        checkpoint_dir: str = "./checkpoints",
+        mode: str = "full",
+) -> None:
+    """
+    ÚJ MÓD: Az egész adatbázison történő tanítás (cross-validation nélkül).
+    """
+    print(f"\n--- Teljes adatbázison történő tanítás indítása (Mode: {mode}) ---")
+    train_loader, _, criterion = create_dataloaders(all_samples, processor, mode=mode)
+
+    model = DysarthriaClassifier(model_name).to(device)
+    optimizer = build_optimizer(model)
+
+    run_training_pipeline(
+        model=model,
+        train_loader=train_loader,
+        optimizer=optimizer,
+        criterion=criterion,
+        device=device,
+        num_epochs=num_epochs,
+        mode=mode,
+        checkpoint_dir=checkpoint_dir,
+        checkpoint_kwargs={"run": 0, "test_spk": "full_dataset"},
+    )
+    print("Teljes adatbázis tanítása befejeződött.")
+
 
 
 @torch.no_grad()
@@ -657,7 +721,7 @@ def loso_cv(
     checkpoint_dir:   str  = "./checkpoints",
     claim_ttl:        int  = 86400,
     claim_dir:        Optional[str] = None,
-    base_seed:        int  = 42,  # MODOSITAS: Alap seed fogadasa
+    base_seed:        int  = 42,
 ) -> Dict[str, List[float]]:
     """LOSO CV with per-fold claiming for concurrent workers."""
     results: Dict[str, List[float]] = {"accuracy": [], "f1": []}
@@ -674,6 +738,7 @@ def loso_cv(
     per_run_f1  = {r: [] for r in range(n_runs)}
 
     claim_storage_dir = claim_dir if claim_dir is not None else checkpoint_dir
+    mode = "salr" if use_salr else "baseline"
 
     print(f"\nStarting LOSO with {len(tasks)} total tasks (runs x speakers)")
 
@@ -696,7 +761,7 @@ def loso_cv(
             tasks.remove((run, test_spk))
             continue
 
-        # ── MÓDOSÍTÁS: Egyedi, determinisztikus seed beállítása a feladathoz ──
+        # Determinisztikus seed feladatonként
         spk_idx = dysarthric_spks.index(test_spk)
         task_seed = base_seed + (run * 1000) + spk_idx
         random.seed(task_seed)
@@ -704,7 +769,6 @@ def loso_cv(
         torch.manual_seed(task_seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(task_seed)
-        # ─────────────────────────────────────────────────────────────────────
 
         train_samples = [s for s in all_samples if s['speaker_id'] != test_spk and s['is_common']]
         test_samples  = [s for s in by_speaker[test_spk] if not s['is_common']]
@@ -715,54 +779,32 @@ def loso_cv(
             tasks.remove((run, test_spk))
             continue
 
-        train_ds = UASpeechDataset(train_samples, processor)
-        test_ds  = UASpeechDataset(test_samples,  processor)
-
-        test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+        # ── KISZERVEZETT ADATBETÖLTŐK ÉS CRITERION LÉTREHOZÁSA ──
+        train_loader, test_loader, criterion = create_dataloaders(
+            train_samples=train_samples,
+            processor=processor,
+            mode=mode,
+            test_samples=test_samples
+        )
 
         model     = DysarthriaClassifier(model_name).to(device)
         optimizer = build_optimizer(model)
 
-        if use_salr:
-            anchor_sampler = RandomBatchSampler(dataset_size=len(train_samples), batch_size=4)
-            salr_collator  = SALRTripletCollator(train_ds)
-            train_loader   = DataLoader(train_ds, batch_sampler=anchor_sampler, collate_fn=salr_collator)
-            criterion      = SALRLoss()
+        # ── KISZERVEZETT TANÍTÁSI CIKLUS ÉS CHECKPOINTING ──
+        run_training_pipeline(
+            model=model,
+            train_loader=train_loader,
+            optimizer=optimizer,
+            criterion=criterion,
+            device=device,
+            num_epochs=num_epochs,
+            mode=mode,
+            test_loader=test_loader,
+            checkpoint_dir=checkpoint_dir,
+            checkpoint_kwargs={"run": run, "test_spk": test_spk}
+        )
 
-            step         = 0
-            loss_history = []
-
-            for epoch in range(num_epochs):
-                epoch_stats, step = train_one_epoch_salr(model, train_loader, optimizer, criterion, device, step)
-                loss_history.append({"epoch": epoch + 1, **epoch_stats})
-
-                val_metrics = evaluate(model, test_loader, device)
-                print(f"    epoch {epoch + 1:3d}/{num_epochs}  loss={epoch_stats['loss']:.4f}  ce={epoch_stats['loss_ce']:.4f}  triplet={epoch_stats['loss_triplet']:.4f}  alpha={epoch_stats['alpha']:.1f} | Val Acc: {val_metrics['accuracy']:5.1f}%  F1: {val_metrics['f1']:5.1f}%")
-
-                is_last = (epoch + 1) == num_epochs
-                if (epoch + 1) % CHECKPOINT_EVERY == 0 or is_last:
-                    ep_ckpt_path = checkpoint_path(checkpoint_dir, run, test_spk, use_salr, epoch=epoch + 1)
-                    save_checkpoint(ep_ckpt_path, model, epoch=epoch + 1, num_epochs=num_epochs, step=step, run=run,
-                                    test_spk=test_spk, use_salr=True, loss_history=loss_history)
-        else:
-            train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-            criterion_base = nn.CrossEntropyLoss()
-
-            loss_history = []
-
-            for epoch in range(num_epochs):
-                loss = train_one_epoch_baseline(model, train_loader, optimizer, criterion_base, device)
-                loss_history.append({"epoch": epoch + 1, "loss": loss})
-
-                val_metrics = evaluate(model, test_loader, device)
-                print(f"    epoch {epoch + 1:3d}/{num_epochs}  | Val Acc: {val_metrics['accuracy']:5.1f}%  F1: {val_metrics['f1']:5.1f}%")
-
-                is_last = (epoch + 1) == num_epochs
-                if (epoch + 1) % CHECKPOINT_EVERY == 0 or is_last:
-                    ep_ckpt_path = checkpoint_path(checkpoint_dir, run, test_spk, use_salr, epoch=epoch + 1)
-                    save_checkpoint(ep_ckpt_path, model, epoch=epoch + 1, num_epochs=num_epochs, step=0, run=run,
-                                    test_spk=test_spk, use_salr=False, loss_history=loss_history)
-
+        # Végső kiértékelés a fold végén
         metrics = evaluate(model, test_loader, device)
         per_run_acc[run].append(metrics['accuracy'])
         per_run_f1[run].append(metrics['f1'])
@@ -1028,7 +1070,9 @@ def claim_fold(ckpt_dir: str, run: int, test_spk: str, use_salr: bool, ttl: int 
     # Automatikusan létrehozzuk a mappát, ha még nem létezik
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    claim_path = os.path.join(ckpt_dir, f"{run}_{test_spk}_{'salr' if use_salr else 'nosalr'}.claim")
+    # Helytelen volt: claim_path = os.path.join(ckpt_dir, f"{run}_{test_spk}_{'salr' if use_salr else 'nosalr'}.claim")
+    # Helyes (egységes a release_claim-mel):
+    claim_path = _claim_dir_path(ckpt_dir, run, test_spk, use_salr)
 
     # ... az eredeti os.open kód folytatódik innen:
     # fd = os.open(claim_path, flags)
@@ -1138,8 +1182,8 @@ def parse_args() -> argparse.Namespace:
                    help="Seconds after which an in-progress claim is considered stale.")
     p.add_argument("--claim-dir",   default=None,
                    help="Directory to store claim markers (defaults to checkpoint_dir).")
-    p.add_argument("--baseline",    action="store_true",
-                   help="Run fine-tuned wav2vec2 baseline (cross-entropy only).")
+    p.add_argument("--mode", choices=["baseline", "salr", "full"], default="salr",
+                   help="Training method: 'baseline', 'salr', or 'full' (whole database).")
     p.add_argument("--device",      default=None,
                    help="'cuda', 'mps', or 'cpu'. Auto-detected if omitted.")
     p.add_argument("--seed",        type=int, default=42)
@@ -1168,27 +1212,40 @@ def main() -> None:
         device = torch.device(args.device)
 
     print(f"Device : {device}")
-    print(f"Model  : {'Wav2Vec2 baseline' if args.baseline else 'SALR'}")
+    #print(f"Model  : {'Wav2Vec2 baseline' if args.baseline else 'SALR'}")
     print(f"Epochs : {args.epochs}  |  Runs : {args.runs}\n")
 
     processor = Wav2Vec2Processor.from_pretrained(args.model_name)
 
     samples, dysarthric_spks = load_ua_speech(args.data_root, args.metadata)
 
-    loso_cv(
-        all_samples=samples,
-        dysarthric_spks=dysarthric_spks,
-        processor=processor,
-        device=device,
-        model_name=args.model_name,
-        num_epochs=args.epochs,
-        n_runs=args.runs,
-        use_salr=not args.baseline,
-        checkpoint_dir=args.checkpoint_dir,
-        claim_ttl=args.claim_ttl,
-        claim_dir=args.claim_dir,
-        base_seed=args.seed,  # MODOSITAS: Atadjuk az alapszamot
-    )
+    if args.mode == "full":
+        # Új opció: az egész adatbázison tanít
+        train_full_dataset(
+            all_samples=samples,
+            processor=processor,
+            device=device,
+            model_name=args.model_name,
+            num_epochs=args.epochs,
+            checkpoint_dir=args.checkpoint_dir,
+            mode=args.mode,
+        )
+    else:
+        # Eredeti LOSO Cross-Validation futtatása (baseline vagy salr módban)
+        loso_cv(
+            all_samples=samples,
+            dysarthric_spks=dysarthric_spks,
+            processor=processor,
+            device=device,
+            model_name=args.model_name,
+            num_epochs=args.epochs,
+            n_runs=args.runs,
+            use_salr=(args.mode == "salr"),
+            checkpoint_dir=args.checkpoint_dir,
+            claim_ttl=args.claim_ttl,
+            claim_dir=args.claim_dir,
+            base_seed=args.seed,
+        )
 
 
 if __name__ == "__main__":
