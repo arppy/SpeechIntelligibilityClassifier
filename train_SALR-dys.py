@@ -422,6 +422,7 @@ def train_one_epoch(
         device: torch.device,
         mode: str = "salr",
         step: int = 0,
+        verbose: bool = False,
 ) -> Tuple[Dict[str, float], int]:
     """
     Egységes tanítási epoch részletes batch-szintű debug logolással.
@@ -430,7 +431,8 @@ def train_one_epoch(
     totals = defaultdict(float)
     n_batches = 0
 
-    print(f"\n    [DEBUG Training] Beginning Epoch — Initial Step: {step}")
+    if verbose:
+        print(f"\n    [DEBUG Training] Beginning Epoch — Initial Step: {step}")
 
     for batch_idx, batch in enumerate(loader):
         iv = batch["input_values"].to(device)
@@ -463,24 +465,24 @@ def train_one_epoch(
             totals["loss_triplet"] += info["loss_triplet"]
             totals["alpha"] = info["alpha"]
 
-            # ── VISSZARAKOTT RÉSZLETES DEBUG PRINT (SALR) ──
-            with torch.no_grad():
-                emb_mean = anchor_emb.mean().item()
-                emb_std = anchor_emb.std().item()
-                emb_min = anchor_emb.min().item()
-                emb_max = anchor_emb.max().item()
+            if verbose:
+                with torch.no_grad():
+                    emb_mean = anchor_emb.mean().item()
+                    emb_std = anchor_emb.std().item()
+                    emb_min = anchor_emb.min().item()
+                    emb_max = anchor_emb.max().item()
 
-                sample_vector = anchor_emb[0, :5].cpu().tolist()
-                formatted_sample = ", ".join(f"{v:.4f}" for v in sample_vector)
+                    sample_vector = anchor_emb[0, :5].cpu().tolist()
+                    formatted_sample = ", ".join(f"{v:.4f}" for v in sample_vector)
 
-            print(
-                f"      [Batch {batch_idx + 1:03d}/{len(loader):03d} | Step {step:05d}] "
-                f"Loss: {info['loss']:.4f} (CE: {info['loss_ce']:.4f}, Triplet: {info['loss_triplet']:.4f}) | "
-                f"Alpha: {info['alpha']:.1f} | GradNorm: {grad_norm:.4f}\n"
-                f"        └─ Embeddings Shape: {list(anchor_emb.shape)} | "
-                f"Stats -> Mean: {emb_mean:.4f}, Std: {emb_std:.4f}, Min: {emb_min:.4f}, Max: {emb_max:.4f}\n"
-                f"        └─ Anchor[0][:5] Sample Vector: [{formatted_sample}]"
-            )
+                print(
+                    f"      [Batch {batch_idx + 1:03d}/{len(loader):03d} | Step {step:05d}] "
+                    f"Loss: {info['loss']:.4f} (CE: {info['loss_ce']:.4f}, Triplet: {info['loss_triplet']:.4f}) | "
+                    f"Alpha: {info['alpha']:.1f} | GradNorm: {grad_norm:.4f}\n"
+                    f"        └─ Embeddings Shape: {list(anchor_emb.shape)} | "
+                    f"Stats -> Mean: {emb_mean:.4f}, Std: {emb_std:.4f}, Min: {emb_min:.4f}, Max: {emb_max:.4f}\n"
+                    f"        └─ Anchor[0][:5] Sample Vector: [{formatted_sample}]"
+                )
             step += 1
 
         else:
@@ -494,20 +496,21 @@ def train_one_epoch(
             totals["loss"] += loss.item()
 
             # ── DEBUG PRINT (BASELINE / FULL MÓD) ──
-            with torch.no_grad():
-                emb_norm = F.normalize(emb, p=2, dim=-1)
-                emb_mean = emb_norm.mean().item()
-                emb_std = emb_norm.std().item()
-                sample_vector = emb_norm[0, :5].cpu().tolist()
-                formatted_sample = ", ".join(f"{v:.4f}" for v in sample_vector)
+            if verbose:
+                with torch.no_grad():
+                    emb_norm = F.normalize(emb, p=2, dim=-1)
+                    emb_mean = emb_norm.mean().item()
+                    emb_std = emb_norm.std().item()
+                    sample_vector = emb_norm[0, :5].cpu().tolist()
+                    formatted_sample = ", ".join(f"{v:.4f}" for v in sample_vector)
 
-            print(
-                f"      [Batch {batch_idx + 1:03d}/{len(loader):03d} | Step {step:05d}] "
-                f"Loss (CE): {loss.item():.4f} | GradNorm: {grad_norm:.4f}\n"
-                f"        └─ Embeddings Shape: {list(emb.shape)} | "
-                f"Stats -> Mean: {emb_mean:.4f}, Std: {emb_std:.4f}\n"
-                f"        └─ Sample Vector[0][:5]: [{formatted_sample}]"
-            )
+                print(
+                    f"      [Batch {batch_idx + 1:03d}/{len(loader):03d} | Step {step:05d}] "
+                    f"Loss (CE): {loss.item():.4f} | GradNorm: {grad_norm:.4f}\n"
+                    f"        └─ Embeddings Shape: {list(emb.shape)} | "
+                    f"Stats -> Mean: {emb_mean:.4f}, Std: {emb_std:.4f}\n"
+                    f"        └─ Sample Vector[0][:5]: [{formatted_sample}]"
+                )
             step += 1
 
         n_batches += 1
@@ -530,6 +533,7 @@ def run_training_pipeline(
         test_loader: Optional[DataLoader] = None,
         checkpoint_dir: str = "./checkpoints",
         checkpoint_kwargs: Optional[Dict] = None,
+        verbose: bool = False,
 ) -> List[Dict]:
     """
     Közös tanítási ciklus checkpoint-kezeléssel és validációval.
@@ -540,7 +544,7 @@ def run_training_pipeline(
 
     for epoch in range(num_epochs):
         epoch_stats, step = train_one_epoch(
-            model, train_loader, optimizer, criterion, device, mode=mode, step=step
+            model, train_loader, optimizer, criterion, device, mode=mode, step=step, verbose=verbose
         )
         loss_history.append({"epoch": epoch + 1, **epoch_stats})
 
@@ -617,6 +621,7 @@ def train_full_dataset(
         num_epochs: int = 30,
         checkpoint_dir: str = "./checkpoints",
         mode: str = "full",
+        verbose: bool = False,
 ) -> None:
     """
     ÚJ MÓD: Az egész adatbázison történő tanítás (cross-validation nélkül).
@@ -637,6 +642,7 @@ def train_full_dataset(
         mode=mode,
         checkpoint_dir=checkpoint_dir,
         checkpoint_kwargs={"run": 0, "test_spk": "full_dataset"},
+        verbose=verbose,
     )
     print("Teljes adatbázis tanítása befejeződött.")
 
@@ -723,6 +729,7 @@ def loso_cv(
     claim_ttl:        int  = 86400,
     claim_dir:        Optional[str] = None,
     base_seed:        int  = 42,
+    verbose:          bool = False,
 ) -> Dict[str, List[float]]:
     """LOSO CV with per-fold claiming for concurrent workers."""
     results: Dict[str, List[float]] = {"accuracy": [], "f1": []}
@@ -802,7 +809,8 @@ def loso_cv(
             mode=mode,
             test_loader=test_loader,
             checkpoint_dir=checkpoint_dir,
-            checkpoint_kwargs={"run": run, "test_spk": test_spk}
+            checkpoint_kwargs={"run": run, "test_spk": test_spk},
+            verbose=verbose,
         )
 
         # Végső kiértékelés a fold végén
@@ -867,13 +875,15 @@ def intelligibility_to_severity(intelligibility: float) -> str:
 def load_ua_speech(
     data_root:     str,
     metadata_path: str,
+    verbose:       bool = False,
 ) -> Tuple[List[Dict], List[str]]:
     """
     Load UA-Speech into a flat list of sample dicts with added debug output.
     """
     import soundfile as sf
 
-    print(f"\n[DEBUG Data Loading] Reading metadata from: {metadata_path}")
+    if verbose:
+        print(f"\n[DEBUG Data Loading] Reading metadata from: {metadata_path}")
     meta: Dict[str, Dict] = {}
     with open(metadata_path, newline="") as fh:
         for row in csv.DictReader(fh):
@@ -883,7 +893,8 @@ def load_ua_speech(
                 "is_dysarthric":   row["is_dysarthric"].strip().lower() == "true",
             }
 
-    print(f"[DEBUG Data Loading] Found {len(meta)} total speakers in CSV metadata.")
+    if verbose:
+        print(f"[DEBUG Data Loading] Found {len(meta)} total speakers in CSV metadata.")
 
     samples: List[Dict] = []
     dysarthric_spks: List[str] = []
@@ -894,7 +905,8 @@ def load_ua_speech(
         spk_dir = os.path.join(data_root, spk_id)
         if not os.path.isdir(spk_dir):
             missing_dirs += 1
-            print(f"  [DEBUG Warning] Directory missing for speaker: {spk_id} ({spk_dir})")
+            if verbose:
+                print(f"  [DEBUG Warning] Directory missing for speaker: {spk_id} ({spk_dir})")
             continue
 
         if spk_meta["is_dysarthric"]:
@@ -904,7 +916,8 @@ def load_ua_speech(
         severity_int = SEVERITY_TO_INT[severity_str]
 
         wav_files = [f for f in sorted(os.listdir(spk_dir)) if f.lower().endswith(".wav")]
-        print(f"  [DEBUG Loading Speaker] {spk_id:<5s} | Dysarthric: {str(spk_meta['is_dysarthric']):<5s} | Severity: {severity_str:<8s} | Wav files found: {len(wav_files)}")
+        if verbose:
+            print(f"  [DEBUG Loading Speaker] {spk_id:<5s} | Dysarthric: {str(spk_meta['is_dysarthric']):<5s} | Severity: {severity_str:<8s} | Wav files found: {len(wav_files)}")
 
         spk_sample_count = 0
         for fname in wav_files:
@@ -919,7 +932,8 @@ def load_ua_speech(
             try:
                 waveform, sr = sf.read(wav_path, dtype="float32")
             except Exception as e:
-                print(f"  [DEBUG Error] Could not read file {wav_path}: {e}")
+                if verbose:
+                    print(f"  [DEBUG Error] Could not read file {wav_path}: {e}")
                 continue
 
             # Mono
@@ -958,16 +972,17 @@ def load_ua_speech(
     common_count = sum(1 for s in samples if s["is_common"])
     uncommon_count = len(samples) - common_count
 
-    print(f"\n[DEBUG Data Loading Summary]")
-    print(f"  Total samples loaded  : {len(samples)}")
-    print(f"  Common word samples   : {common_count}")
-    print(f"  Uncommon word samples : {uncommon_count}")
-    print(f"  Dysarthric speakers   : {len(dysarthric_spks)} ({', '.join(dysarthric_spks)})")
-    if missing_dirs > 0:
-        print(f"  Missing directories   : {missing_dirs}")
-    if n_truncated > 0:
-        print(f"  Truncated clips (> {MAX_CLIP_SECONDS}s): {n_truncated}")
-    print("-" * 55 + "\n")
+    if verbose:
+        print(f"\n[DEBUG Data Loading Summary]")
+        print(f"  Total samples loaded  : {len(samples)}")
+        print(f"  Common word samples   : {common_count}")
+        print(f"  Uncommon word samples : {uncommon_count}")
+        print(f"  Dysarthric speakers   : {len(dysarthric_spks)} ({', '.join(dysarthric_spks)})")
+        if missing_dirs > 0:
+            print(f"  Missing directories   : {missing_dirs}")
+        if n_truncated > 0:
+            print(f"  Truncated clips (> {MAX_CLIP_SECONDS}s): {n_truncated}")
+        print("-" * 55 + "\n")
 
     return samples, dysarthric_spks
 
@@ -1191,6 +1206,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint_dir", default="./checkpoints",
                    help="Directory for per-fold checkpoints (shared filesystem "
                         "if running multiple machines in parallel).")
+    p.add_argument("--verbose",     action="store_true",
+                   help="Enable detailed debug logging during loading and training.")
     return p.parse_args()
 
 
@@ -1218,7 +1235,7 @@ def main() -> None:
 
     processor = Wav2Vec2Processor.from_pretrained(args.model_name)
 
-    samples, dysarthric_spks = load_ua_speech(args.data_root, args.metadata)
+    samples, dysarthric_spks = load_ua_speech(args.data_root, args.metadata, verbose=args.verbose)
 
     if args.mode == "full":
         # Új opció: az egész adatbázison tanít
@@ -1230,6 +1247,7 @@ def main() -> None:
             num_epochs=args.epochs,
             checkpoint_dir=args.checkpoint_dir,
             mode=args.mode,
+            verbose=args.verbose,
         )
     else:
         # Eredeti LOSO Cross-Validation futtatása (baseline vagy salr módban)
@@ -1246,6 +1264,7 @@ def main() -> None:
             claim_ttl=args.claim_ttl,
             claim_dir=args.claim_dir,
             base_seed=args.seed,
+            verbose=args.verbose,
         )
 
 
