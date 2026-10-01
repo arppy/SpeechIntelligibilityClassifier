@@ -19,8 +19,6 @@ Requirements:
 # ──────────────────────────────────────────────────────────────────────────────
 
 import os
-import csv
-import math
 import random
 import argparse
 from typing import Dict, List, Optional, Tuple
@@ -38,18 +36,22 @@ from sklearn.linear_model import LogisticRegression
 from collections import defaultdict
 from torch.utils.data import BatchSampler
 
+from params import dys_speaker_dict
+from models import DysarthriaClassifier
+from dataset import UASpeechDataset, SALRTripletCollator, collate_fn, SEVERITY_TO_INT, label_to_severity
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants  (all directly from the paper)
 # ──────────────────────────────────────────────────────────────────────────────
+from dataset import SAMPLE_RATE
+from models import NUM_CLASSES
 
-SAMPLE_RATE        = 16000   # wav2vec 2.0 native sample rate
-NUM_CLASSES        = 4        # very-low / low / medium / high severity
 MAX_CLIP_SECONDS    = 15.6    # clips longer than this are truncated on load,
                                # so a single long outlier doesn't force every
                                # other sample in its batch to pad up to it
 
 # § 2.2 – fine-tuning hyper-parameters
-BATCH_SIZE         = 3
+BATCH_SIZE         = 4
 LEARNING_RATE      = 1e-4     # 0.0005
 ADAM_BETAS         = (0.9, 0.98)
 ADAM_EPSILON       = 1e-8
@@ -59,259 +61,8 @@ TRIPLET_MARGIN     = 0.05     # m  in Eq. 1
 LAMBDA             = 0.01     # λ  weighting for triplet term
 WARMUP_STEPS       = 3000     # α = 0 for first 3 000 steps, then α = 1
 
-# UA-Speech severity → integer label mapping  (Table 1, § 2.1)
-SEVERITY_TO_INT = {
-    "very_low": 0,   # 76–100 % intelligible
-    "low":      1,   # 51–75 %
-    "medium":   2,   # 26–50 %
-    "high":     3,   #  0–25 %
-}
+
 INT_TO_SEVERITY = {v: k for k, v in SEVERITY_TO_INT.items()}
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 1.  Dataset
-# ──────────────────────────────────────────────────────────────────────────────
-
-class UASpeechDataset(Dataset):
-    """
-    Wraps pre-loaded sample dicts for use with a DataLoader.
-
-    Each sample dict must contain:
-        waveform      (np.ndarray, float32, 16 kHz, mono)
-        speaker_id    (str)
-        severity      (int  0–3)
-        word_id       (str, unique word identifier)
-        is_common     (bool, True for the 155 repeated common words)
-    """
-
-    def __init__(
-        self,
-        samples:     List[Dict],
-        processor:   Wav2Vec2Processor,
-        sample_rate: int = SAMPLE_RATE,
-    ):
-        self.samples     = samples
-        self.processor   = processor
-        self.sample_rate = sample_rate
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, idx: int) -> Dict:
-        item = self.samples[idx]
-        proc = self.processor(
-            item["waveform"],
-            sampling_rate=self.sample_rate,
-            return_tensors="pt",
-            padding=False,
-        )
-        return {
-            "input_values": proc.input_values.squeeze(0),   # (T,)
-            "severity":     item["severity"],
-            "speaker_id":   item["speaker_id"],
-            "word_id":      item["word_id"],
-            "idx": idx,  # NEW — lets SALRTripletCollator find this sample again
-        }
-
-
-def collate_fn(batch: List[Dict]) -> Dict:
-    """Pad variable-length waveforms to the longest in the batch."""
-    max_len = max(b["input_values"].shape[0] for b in batch)
-
-    padded_iv  = torch.zeros(len(batch), max_len)
-    attn_mask  = torch.zeros(len(batch), max_len, dtype=torch.long)
-
-    for i, b in enumerate(batch):
-        L = b["input_values"].shape[0]
-        padded_iv[i, :L]  = b["input_values"]
-        attn_mask[i, :L]  = 1
-
-    return {
-        "input_values": padded_iv,
-        "attention_mask": attn_mask,
-        "severity":      torch.tensor([b["severity"]    for b in batch], dtype=torch.long),
-        "speaker_id":    [b["speaker_id"] for b in batch],
-        "word_id":       [b["word_id"]    for b in batch],
-    }
-class SALRTripletCollator:
-    """
-    Turns a batch of raw anchor indices into a full (Anchor, Negative,
-    Positive) triplet batch: for each anchor, finds a same-speaker,
-    different-word "negative" and a different-speaker (same severity),
-    same-word-as-negative "positive", then fetches and processes their
-    waveforms. If an anchor can't form a triplet, draws a fresh
-    replacement and retries.
-
-    Returned batches are laid out [A, N, P, A, N, P, ...] — this ordering
-    convention is what train_one_epoch_salr splits back out before
-    calling SALRLoss.
-    """
-
-    def __init__(self, dataset: "UASpeechDataset", max_resample_attempts: int = 50):
-        self.dataset = dataset
-        self.tree = self._build_tree(dataset.samples)
-        self.max_resample_attempts = max_resample_attempts
-
-    @staticmethod
-    def _build_tree(dataset_samples: List[Dict]) -> Dict:
-        """severity -> speaker -> word -> [indices]."""
-        tree = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-        for idx, sample in enumerate(dataset_samples):
-            tree[sample["severity"]][sample["speaker_id"]][sample["word_id"]].append(idx)
-        return tree
-
-    def _find_triplet(self, anchor_idx: int) -> Optional[Tuple[int, int, int]]:
-        """Resolve one anchor into (anchor_idx, negative_idx, positive_idx), or None."""
-        anchor = self.dataset.samples[anchor_idx]
-        sev, spk_x, word_a = anchor["severity"], anchor["speaker_id"], anchor["word_id"]
-
-        negative_candidates = []
-        for word_b, indices in self.tree[sev][spk_x].items():
-            if word_b != word_a:
-                negative_candidates.extend((word_b, i) for i in indices)
-        random.shuffle(negative_candidates)
-
-        for word_b, negative_idx in negative_candidates:
-            positive_candidates = []
-            for spk_y, word_dict in self.tree[sev].items():
-                if spk_y != spk_x and word_b in word_dict:
-                    positive_candidates.extend(word_dict[word_b])
-            if positive_candidates:
-                return anchor_idx, negative_idx, random.choice(positive_candidates)
-
-        return None
-
-    def _resolve(self, anchor_idx: int) -> Tuple[int, int, int]:
-        for _ in range(self.max_resample_attempts):
-            triplet = self._find_triplet(anchor_idx)
-            if triplet is not None:
-                return triplet
-            anchor_idx = random.randrange(len(self.dataset.samples))
-        raise RuntimeError(f"Could not resolve a triplet after {self.max_resample_attempts} attempts.")
-
-    def __call__(self, batch_items: List[Dict]) -> Dict:
-        resolved_indices = []
-        for item in batch_items:
-            resolved_indices.extend(self._resolve(item["idx"]))
-        items = [self.dataset[i] for i in resolved_indices]
-        return collate_fn(items)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 2.  Model Architecture
-# ──────────────────────────────────────────────────────────────────────────────
-
-class ClassificationHead(nn.Module):
-    """
-    Two-layer linear head with ReLU activation (§ 2.2).
-
-        Linear(768 → 768) → ReLU → Linear(768 → num_classes)
-    """
-
-    def __init__(self, hidden_size: int = 768, num_classes: int = NUM_CLASSES):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, num_classes),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class DysarthriaClassifier(nn.Module):
-    """
-    Shared backbone used by both the fine-tuned baseline and SALR.
-
-    Architecture (§ 2.2):
-        facebook/wav2vec2-base
-          • 12 Transformer blocks
-          • hidden size  : 768
-          • FFN size     : 3 072
-          • attention heads: 8
-          • pretrained on 960 h LibriSpeech
-        └─ mean-pool last hidden states → embedding  (B, 768)
-              └─ ClassificationHead → logits  (B, 4)
-
-    The embeddings before the classification head are also returned
-    so the SALR loss can operate on them directly.
-    """
-
-    def __init__(
-        self,
-        model_name:  str = "facebook/wav2vec2-base",
-        num_classes: int = NUM_CLASSES,
-    ):
-        super().__init__()
-        self.wav2vec2   = Wav2Vec2Model.from_pretrained(model_name)
-        hidden_size     = self.wav2vec2.config.hidden_size          # 768
-        self.classifier = ClassificationHead(hidden_size, num_classes)
-
-    # ------------------------------------------------------------------
-    # Internal helper: frame-level attention mask
-    # wav2vec 2.0 downsamples audio by a factor of ≈ 320 via its CNN
-    # feature extractor.  HuggingFace exposes the exact formula.
-    # ------------------------------------------------------------------
-    def _frame_mask(
-        self,
-        attention_mask: torch.Tensor,   # (B, T_audio)
-        num_frames:     int,
-    ) -> torch.Tensor:                  # (B, T_frames)
-        """
-        Project the sample-level padding mask down to frame level using
-        the model's own stride calculation.
-        """
-        lengths = attention_mask.sum(dim=1)                         # (B,)
-        frame_lengths = self.wav2vec2._get_feat_extract_output_lengths(lengths)
-        mask = torch.zeros(
-            attention_mask.size(0), num_frames,
-            device=attention_mask.device,
-        )
-        for i, fl in enumerate(frame_lengths):
-            fl_clamped = min(int(fl.item()), num_frames)
-            mask[i, :fl_clamped] = 1.0
-        return mask
-
-    def get_embeddings(
-        self,
-        input_values:   torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Forward pass through wav2vec 2.0 + masked mean-pool.
-
-        Returns utterance embeddings of shape (B, 768).
-        """
-        out = self.wav2vec2(
-            input_values,
-            attention_mask=attention_mask,
-        )
-        hidden = out.last_hidden_state          # (B, T_frames, 768)
-
-        if attention_mask is not None:
-            fmask = self._frame_mask(attention_mask, hidden.size(1))  # (B, T_frames)
-            denom = fmask.sum(dim=1, keepdim=True).clamp(min=1)
-            emb   = (hidden * fmask.unsqueeze(-1)).sum(dim=1) / denom
-        else:
-            emb = hidden.mean(dim=1)
-
-        return emb                              # (B, 768)
-
-    def forward(
-        self,
-        input_values:   torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns
-        -------
-        logits     : (B, num_classes)
-        embeddings : (B, 768)   ← used by SALR triplet loss
-        """
-        emb    = self.get_embeddings(input_values, attention_mask)
-        logits = self.classifier(emb)
-        return logits, emb
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -597,7 +348,7 @@ def create_dataloaders(
     train_ds = UASpeechDataset(train_samples, processor)
 
     if mode == "salr":
-        anchor_sampler = RandomBatchSampler(dataset_size=len(train_samples), batch_size=4)
+        anchor_sampler = RandomBatchSampler(dataset_size=len(train_samples), batch_size=BATCH_SIZE)
         salr_collator = SALRTripletCollator(train_ds)
         train_loader = DataLoader(train_ds, batch_sampler=anchor_sampler, collate_fn=salr_collator)
         criterion = SALRLoss()
@@ -860,21 +611,8 @@ def loso_cv(
 # Replace the sets below with the actual UA-Speech word IDs from the corpus.
 # These are illustrative identifiers based on the dataset description.
 
-
-def intelligibility_to_severity(intelligibility: float) -> str:
-    """Map % intelligibility → severity label (Table 1)."""
-    if intelligibility >= 76:
-        return "very_low"
-    if intelligibility >= 51:
-        return "low"
-    if intelligibility >= 26:
-        return "medium"
-    return "high"
-
-
 def load_ua_speech(
     data_root:     str,
-    metadata_path: str,
     verbose:       bool = False,
 ) -> Tuple[List[Dict], List[str]]:
     """
@@ -882,26 +620,12 @@ def load_ua_speech(
     """
     import soundfile as sf
 
-    if verbose:
-        print(f"\n[DEBUG Data Loading] Reading metadata from: {metadata_path}")
-    meta: Dict[str, Dict] = {}
-    with open(metadata_path, newline="") as fh:
-        for row in csv.DictReader(fh):
-            spk = row["speaker_id"].strip()
-            meta[spk] = {
-                "intelligibility": float(row["intelligibility"]),
-                "is_dysarthric":   row["is_dysarthric"].strip().lower() == "true",
-            }
-
-    if verbose:
-        print(f"[DEBUG Data Loading] Found {len(meta)} total speakers in CSV metadata.")
-
     samples: List[Dict] = []
     dysarthric_spks: List[str] = []
     n_truncated = 0
     missing_dirs = 0
 
-    for spk_id, spk_meta in meta.items():
+    for spk_id, sev_int in dys_speaker_dict["UASpeech"].items():
         spk_dir = os.path.join(data_root, spk_id)
         if not os.path.isdir(spk_dir):
             missing_dirs += 1
@@ -909,15 +633,13 @@ def load_ua_speech(
                 print(f"  [DEBUG Warning] Directory missing for speaker: {spk_id} ({spk_dir})")
             continue
 
-        if spk_meta["is_dysarthric"]:
-            dysarthric_spks.append(spk_id)
+        dysarthric_spks.append(spk_id)
 
-        severity_str = intelligibility_to_severity(spk_meta["intelligibility"])
-        severity_int = SEVERITY_TO_INT[severity_str]
+        severity_str = label_to_severity(sev_int)
 
         wav_files = [f for f in sorted(os.listdir(spk_dir)) if f.lower().endswith(".wav")]
         if verbose:
-            print(f"  [DEBUG Loading Speaker] {spk_id:<5s} | Dysarthric: {str(spk_meta['is_dysarthric']):<5s} | Severity: {severity_str:<8s} | Wav files found: {len(wav_files)}")
+            print(f"  [DEBUG Loading Speaker] {spk_id:<5s} | Severity: {severity_str:<8s} | Wav files found: {len(wav_files)}")
 
         spk_sample_count = 0
         for fname in wav_files:
@@ -963,7 +685,7 @@ def load_ua_speech(
             samples.append({
                 "waveform":   waveform,
                 "speaker_id": spk_id,
-                "severity":   severity_int,
+                "severity":   sev_int,
                 "word_id":    word_id,
                 "is_common":  is_common,
             })
@@ -1152,15 +874,11 @@ def release_claim(ckpt_dir: str, run: int, test_spk: str, use_salr: bool) -> Non
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-from collections import defaultdict
-import random
-
-
 class RandomBatchSampler(BatchSampler):
     """Yields batch_size independent random indices. No speaker/word/severity
     awareness at all — triplet resolution happens downstream, in the collate fn."""
 
-    def __init__(self, dataset_size: int, batch_size: int = 4):
+    def __init__(self, dataset_size: int, batch_size: int = BATCH_SIZE):
         self.dataset_size = dataset_size
         self.batch_size = batch_size
         self.num_batches = dataset_size // batch_size
@@ -1185,9 +903,6 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--data_root",   required=True,
                    help="Root directory of UA-Speech audio files.")
-    p.add_argument("--metadata",    required=True,
-                   help="Path to speaker metadata CSV "
-                        "(columns: speaker_id, intelligibility, is_dysarthric).")
     p.add_argument("--model_name",  default="facebook/wav2vec2-base",
                    help="HuggingFace model identifier.")
     p.add_argument("--epochs",      type=int, default=30,
@@ -1235,7 +950,7 @@ def main() -> None:
 
     processor = Wav2Vec2Processor.from_pretrained(args.model_name)
 
-    samples, dysarthric_spks = load_ua_speech(args.data_root, args.metadata, verbose=args.verbose)
+    samples, dysarthric_spks = load_ua_speech(args.data_root, verbose=args.verbose)
 
     if args.mode == "full":
         # Új opció: az egész adatbázison tanít

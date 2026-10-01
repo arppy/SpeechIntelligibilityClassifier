@@ -1,5 +1,4 @@
 import argparse
-import csv
 import os
 import re
 from typing import Dict, List, Tuple
@@ -10,14 +9,11 @@ from sklearn.metrics import accuracy_score, f1_score
 from torch.utils.data import DataLoader
 from transformers import Wav2Vec2Processor
 
+
 # Import necessary modules from project files
-from train_SALR_dys import (
-    SEVERITY_TO_INT,
-    DysarthriaClassifier,
-    UASpeechDataset,
-    collate_fn,
-    intelligibility_to_severity,
-)
+from params import dys_speaker_dict
+from dataset import (SEVERITY_TO_INT,UASpeechDataset,collate_fn)
+from models import (DysarthriaClassifier)
 
 SAMPLE_RATE = 16000
 MAX_CLIP_SECONDS = 15.6
@@ -59,31 +55,17 @@ def extract_speaker_from_checkpoint(checkpoint_path: str) -> str:
 def load_speaker_uncommon_samples(
     target_speaker: str,
     data_root: str,
-    metadata_path: str,
 ) -> List[Dict]:
     """
     Loads ONLY the UNCOMMON words for the specified target_speaker from the dataset.
     """
-    print(f"\n[DEBUG] Searching metadata for speaker: {target_speaker}")
-    spk_meta = None
-    with open(metadata_path, newline="") as fh:
-        for row in csv.DictReader(fh):
-            if row["speaker_id"].strip() == target_speaker:
-                spk_meta = {
-                    "intelligibility": float(row["intelligibility"]),
-                    "is_dysarthric": row["is_dysarthric"].strip().lower() == "true",
-                }
-                break
-
-    if spk_meta is None:
-        raise ValueError(f"Speaker not found in metadata file: {target_speaker}")
 
     spk_dir = os.path.join(data_root, target_speaker)
     if not os.path.isdir(spk_dir):
         raise FileNotFoundError(f"Speaker directory not found: {spk_dir}")
 
-    severity_str = intelligibility_to_severity(spk_meta["intelligibility"])
-    severity_int = SEVERITY_TO_INT[severity_str]
+
+    severity_int = dys_speaker_dict["UASpeech"].get(target_speaker)
 
     wav_files = [f for f in sorted(os.listdir(spk_dir)) if f.lower().endswith(".wav")]
     print(f"[DEBUG] Found {len(wav_files)} total wav files for speaker {target_speaker}")
@@ -156,7 +138,6 @@ if __name__ == "__main__":
     parser.add_argument("--model_name", type=str, default="facebook/wav2vec2-base", help="HuggingFace model identifier")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--metadata_path", type=str, default=None, help="Path to the .csv file with metadata")
     parser.add_argument("--data_root", type=str, default="data", help="Path to the folder where data is stored")
 
     args = parser.parse_args()
@@ -180,7 +161,7 @@ if __name__ == "__main__":
 
     # 3. Load processor and filter samples based on extracted speaker
     processor = Wav2Vec2Processor.from_pretrained(args.model_name)
-    test_samples = load_speaker_uncommon_samples(test_spk, args.data_root, args.metadata_path)
+    test_samples = load_speaker_uncommon_samples(test_spk, args.data_root)
 
     # 4. Create Dataset and DataLoader
     test_ds = UASpeechDataset(test_samples, processor)
