@@ -52,7 +52,7 @@ MAX_CLIP_SECONDS    = 15.6    # clips longer than this are truncated on load,
 
 # § 2.2 – fine-tuning hyper-parameters
 BATCH_SIZE         = 4
-LEARNING_RATE      = 1e-4     # 0.0005
+LEARNING_RATE      = 2e-5     # 0.0005
 ADAM_BETAS         = (0.9, 0.98)
 ADAM_EPSILON       = 1e-8
 
